@@ -1,0 +1,77 @@
+# discord-llm-friends — project-wide tunables
+#
+# All values here have defaults baked into src/discord_llm_friends/config.py.
+# This file is for overriding those defaults. Missing keys fall back to the
+# coded defaults — you don't need a complete file, just the bits you want to
+# tune.
+#
+# A handful of operational knobs (LLM_PROVIDER, DAILY_LIMIT, HISTORY_TURNS)
+# also accept env-var overrides; the env var takes precedence over this
+# file. See .env.example for those.
+#
+# This file IS committed. Secrets belong in .env (gitignored).
+
+# LLM provider + model selection ----------------------------------------
+llm:
+  # One of: gemini | claude | openai. Selects which provider call_llm()
+  # routes to. Env override: LLM_PROVIDER.
+  provider: gemini
+
+  # Model identifier for each provider. Whichever provider is selected,
+  # the corresponding identifier is used.
+  models:
+    gemini: gemini-3.5-flash
+    claude: claude-haiku-4-5
+    openai: gpt-5.4
+
+  # Generation knobs applied uniformly across providers.
+  temperature: 0.9
+  max_output_tokens: 2000
+
+# Embeddings (always OpenAI; project decision) --------------------------
+embedding:
+  model: text-embedding-3-small
+  # Embed pipeline batch size. OpenAI accepts much larger; 100 gives useful
+  # progress output and bounds blast radius if a single batch fails.
+  batch_size: 100
+  # Max retries on transient OpenAI errors before giving up.
+  max_retries: 5
+
+# Retrieval -------------------------------------------------------------
+retrieval:
+  # How many ChromaDB hits to pull per query, before assembling the prompt.
+  top_k: 10
+
+# Bot runtime ----------------------------------------------------------
+bot:
+  # Per-user short-window anti-spam, in seconds.
+  rate_limit_seconds: 10
+  # Per-user-per-bot daily quota. Env override: DAILY_LIMIT.
+  daily_limit_per_user: 50
+  # Discord caps single messages at 2000 chars; this is what we'll cut at,
+  # leaving headroom so a trailing emoticon never pushes us over.
+  max_discord_message_chars: 1900
+  # Recent exchanges from THIS channel to surface in the LLM prompt for
+  # cross-bot continuity. Env override: HISTORY_TURNS.
+  history_turns_in_prompt: 3
+
+# Per-channel conversation history -------------------------------------
+history:
+  # How many exchanges to keep per channel on disk. The prompt may use
+  # fewer (see bot.history_turns_in_prompt). Bounded to prevent unbounded
+  # file growth.
+  retention_per_channel: 50
+  # Cap stored question/response lengths so a runaway prompt can't bloat
+  # the history file. Truncation only affects what gets persisted.
+  max_question_chars: 1000
+  max_response_chars: 2000
+
+# Cleanup pipeline (project-wide defaults) -----------------------------
+# Persona-specific overrides (e.g., language-specific quote-block markers
+# or system messages) live in personas/<id>/persona.yaml under `cleanup:`.
+cleanup:
+  # Drop comments shorter than this many words.
+  min_words: 4
+  # Drop comments that begin and end with a matching quote-mark pair
+  # (likely a verbatim quote, not original content).
+  drop_pure_quotes: true

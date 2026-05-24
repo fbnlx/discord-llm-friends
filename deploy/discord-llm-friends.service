@@ -1,0 +1,55 @@
+# Sample systemd unit for running discord-llm-friends on a Linux VM
+# (e.g. a Google Cloud e2-micro). Substitute paths and user, then install:
+#
+#   sudo cp deploy/discord-llm-friends.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now discord-llm-friends.service
+#
+# This unit runs the production-mode `--all` invocation: one process,
+# every persona under personas/<id>/ (excluding _example/). See ADR-0003
+# for the single-process design rationale.
+
+[Unit]
+Description=discord-llm-friends bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- EDIT THESE FOR YOUR HOST ---
+# Unprivileged user to run as. Create with:
+#   sudo useradd --system --create-home --home-dir /opt/discord-llm-friends discord-llm-friends
+User=discord-llm-friends
+Group=discord-llm-friends
+
+# Where the repo lives on the host.
+WorkingDirectory=/opt/discord-llm-friends
+
+# Full path to `uv`. On Ubuntu/Debian with the official installer this is
+# typically /usr/local/bin/uv or /home/<user>/.local/bin/uv. Run
+# `which uv` after install.
+ExecStart=/usr/local/bin/uv run python -m discord_llm_friends.bot --all
+# --------------------------------
+
+# Crash recovery: restart on failure, back off if it keeps crashing.
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+# Hardening — safe-by-default, reduces blast radius if compromised.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# Logging goes to journald. Tail with:
+#   journalctl -u discord-llm-friends -f
+# Filter to one persona with the child-logger name:
+#   journalctl -u discord-llm-friends -f | grep 'bot\.<persona_id>'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

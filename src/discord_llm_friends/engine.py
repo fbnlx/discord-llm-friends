@@ -18,7 +18,9 @@ Env-only knobs (no YAML equivalent):
 
 from __future__ import annotations
 
+import logging
 import os
+import random
 import sys
 from functools import lru_cache
 
@@ -31,10 +33,41 @@ from discord_llm_friends import personas as personas_module
 from discord_llm_friends.history import Exchange
 
 
+logger = logging.getLogger(__name__)
+
+
 # --- Env-only debug knobs ---------------------------------------------------
 
 DEBUG_PROMPT = os.getenv("PERSONA_DEBUG_PROMPT", "").strip() == "1"
 DRY_RUN = os.getenv("PERSONA_DRY_RUN", "").strip() == "1"
+
+
+# --- Response-length randomization -----------------------------------------
+# Each call rolls a length mode from this weighted table; the chosen mode
+# is injected into the system prompt as a target. This is the only
+# reliable way to get length variety — pure prompt-described options
+# collapse onto whichever length the model considers "safe".
+#
+# Weights are integers, summed and normalized by random.choices.
+# Tune by reading INFO logs (each call logs the picked mode) and adjusting.
+
+LENGTH_MODES: list[tuple[str, int, str]] = [
+    # (name, weight, instruction-injected-into-prompt)
+    ("curt",  30, "1-5 words. A grunt, dismissal, single quip, or short jab. Almost no elaboration."),
+    ("short", 45, "ONE sentence. Direct answer in voice."),
+    ("multi", 20, "2-4 sentences. A short opinion or explanation, optionally with one aside."),
+    ("rant",   5, "5+ sentences. Worked-up, opinionated, possibly tangential."),
+]
+
+
+def _pick_length() -> tuple[str, str]:
+    """Roll a length mode for this response. Returns (name, instruction)."""
+    name, _weight, instruction = random.choices(
+        LENGTH_MODES,
+        weights=[w for _, w, _ in LENGTH_MODES],
+        k=1,
+    )[0]
+    return name, instruction
 
 
 # --- Lazy shared clients (per-process singletons) --------------------------
@@ -85,7 +118,12 @@ def _retrieve(persona_id: str, question: str, n: int) -> list[str]:
 
 # --- Prompt assembly -------------------------------------------------------
 
-def _build_system_message(persona: personas_module.Persona, anchors: tuple[str, ...]) -> str:
+def _build_system_message(
+    persona: personas_module.Persona,
+    anchors: tuple[str, ...],
+    length_mode: str,
+    length_instruction: str,
+) -> str:
     tic_lines = (
         "\n".join(f"- {tic}" for tic in persona.tics)
         if persona.tics
@@ -112,19 +150,34 @@ def _build_system_message(persona: personas_module.Persona, anchors: tuple[str, 
         f"{anchor_lines}\n"
         f"\n"
         f"GUIDANCE:\n"
-        f"- Keep responses similar in length to the examples (usually 1–3 "
-        f"sentences; longer rants only if the question really warrants).\n"
-        f"- Match the energy and crudeness of the examples.\n"
-        f"- For topics you wouldn't reasonably know about (e.g. events from "
-        f"after the persona's era), riff in voice rather than refusing — "
-        f"improvise plausibly, but don't invent biographical facts.\n"
-        f"- Don't quote the examples verbatim. Use them as style reference.\n"
-        f"- Other personas may have spoken earlier in this same channel — if "
-        f"a recent conversation is shown below, you can reference what they "
-        f"said, agree, disagree, mock them, whatever fits your voice.\n"
+        f"- TARGET LENGTH FOR THIS RESPONSE: {length_mode} — "
+        f"{length_instruction} Override only if the question genuinely "
+        f"demands a different length (e.g., a list was explicitly requested "
+        f"while \"curt\" was picked, or pure small-talk while \"rant\" was "
+        f"picked).\n"
+        f"- STAY ON SUBJECT. Don't pivot to unrelated topics — even within "
+        f"a rant, any wandering should stay within the asked subject.\n"
+        f"- IMPROVISE confidently. Extrapolate from {name}'s personality "
+        f"to say new things this person could plausibly say — don't just "
+        f"rearrange phrasings from the examples, invent in voice. Just "
+        f"don't invent biographical facts (no new family members, schools, "
+        f"jobs, etc.).\n"
+        f"- DO NOT bring up {name}'s hobbies, games, or specific interests "
+        f"unless the user's question already mentions them. The persona "
+        f"has many interests; resist the urge to advertise them in every "
+        f"response.\n"
+        f"- The retrieved examples in the user message show how {name} "
+        f"talks (vocabulary, register, emoticons). They are STYLE "
+        f"reference, not a topic menu.\n"
+        f"- Match the crudeness and energy of the examples.\n"
+        f"- For topics from after {name}'s era, riff in voice rather than "
+        f"refusing or breaking character.\n"
+        f"- Don't quote the examples verbatim.\n"
+        f"- If a recent conversation is shown, you can react to it — but "
+        f"you're not obligated to reference earlier topics.\n"
         f"- Output ONLY {name}'s reply, in {persona.language}. No analysis, "
-        f"no explanations of your stylistic choices, no English meta-"
-        f"commentary, no markdown formatting, no thinking aloud."
+        f"no English meta-commentary, no markdown formatting, no thinking "
+        f"aloud."
     )
 
 
@@ -154,8 +207,8 @@ def _build_user_message(
     if retrieved:
         retrieved_block = "\n".join(f"- {r}" for r in retrieved)
         sections.append(
-            f"Things {name} has previously written about topics similar to "
-            f"this question:\n{retrieved_block}"
+            f"HOW {name.upper()} TALKS (style/vocabulary reference — match "
+            f"the voice, not the topics):\n{retrieved_block}"
         )
 
     asker_prefix = f" (from @{asker_name})" if asker_name else ""
@@ -285,7 +338,15 @@ def respond(
     anchors = _style_anchors(persona_id)
     retrieved = _retrieve(persona_id, user_question, cfg.CONFIG.retrieval.top_k)
 
-    system_msg = _build_system_message(persona, anchors)
+    length_mode, length_instruction = _pick_length()
+    logger.info(
+        "length_mode=%s persona=%s question=%r",
+        length_mode, persona_id, user_question[:80],
+    )
+
+    system_msg = _build_system_message(
+        persona, anchors, length_mode, length_instruction,
+    )
     user_msg = _build_user_message(
         retrieved=retrieved,
         question=user_question,
@@ -297,6 +358,9 @@ def respond(
     _maybe_log_prompt(system_msg, user_msg)
 
     if DRY_RUN:
-        return "(PERSONA_DRY_RUN=1 — LLM call skipped; prompt logged to stderr)"
+        return (
+            f"(PERSONA_DRY_RUN=1 — length_mode={length_mode}; "
+            f"LLM call skipped; prompt logged to stderr)"
+        )
 
     return call_llm(system_msg, user_msg)

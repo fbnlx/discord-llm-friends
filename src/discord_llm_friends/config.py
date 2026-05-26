@@ -67,6 +67,21 @@ class RetrievalConfig:
 
 
 @dataclass(frozen=True)
+class StyleConfig:
+    """Knobs for per-call random style-example sampling.
+
+    On each response, the engine draws a fresh random subset of cleaned-
+    corpus entries and injects them into the system prompt as voice
+    examples. This rotates which characteristic phrases the LLM sees
+    instead of pinning the same set every call.
+    """
+    # How many cleaned-corpus entries to sample per response. Higher =
+    # richer voice exposure; lower = leaner prompt. ~50 matches the
+    # static-anchor count the engine used before sampling was introduced.
+    sample_size: int = 50
+
+
+@dataclass(frozen=True)
 class BotConfig:
     rate_limit_seconds: int = 10
     daily_limit_per_user: int = 50
@@ -93,6 +108,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    style: StyleConfig = field(default_factory=StyleConfig)
     bot: BotConfig = field(default_factory=BotConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
@@ -124,6 +140,7 @@ def load_config(path: Path | None = None) -> Config:
             llm=_override(cfg.llm, data.get("llm")),
             embedding=_override(cfg.embedding, data.get("embedding")),
             retrieval=_override(cfg.retrieval, data.get("retrieval")),
+            style=_override(cfg.style, data.get("style")),
             bot=_override(cfg.bot, data.get("bot")),
             history=_override(cfg.history, data.get("history")),
             cleanup=_override(cfg.cleanup, data.get("cleanup")),

@@ -3,7 +3,8 @@
 Public entry point: `respond(persona_id, question, ...)`.
 
 Pipeline:
-  1. Load the persona's description + tics + style anchors.
+  1. Load the persona's description + tics, and draw a fresh random
+     sample of style examples from the cleaned corpus.
   2. Embed the user's question with the embedding model in CONFIG.
   3. Query the persona's ChromaDB collection for top-K relevant comments.
   4. Assemble a system prompt (who they are + style examples) and a user
@@ -96,9 +97,15 @@ def _persona(persona_id: str) -> personas_module.Persona:
 
 
 @lru_cache(maxsize=16)
-def _style_anchors(persona_id: str) -> tuple[str, ...]:
-    # Return a tuple so it's hashable for lru_cache and immutable to callers.
-    return tuple(personas_module.load_style_anchors(_persona(persona_id)))
+def _cleaned_corpus(persona_id: str) -> tuple[str, ...]:
+    """Load the persona's cleaned corpus once and cache it.
+
+    Used as the pool for per-call style-example sampling — each
+    `respond()` draws a fresh random subset from this tuple, so the
+    system prompt shows different examples on every query. Returns a
+    tuple so it's hashable for lru_cache and immutable to callers.
+    """
+    return tuple(personas_module.load_cleaned(_persona(persona_id)))
 
 
 # --- Retrieval -------------------------------------------------------------
@@ -120,7 +127,7 @@ def _retrieve(persona_id: str, question: str, n: int) -> list[str]:
 
 def _build_system_message(
     persona: personas_module.Persona,
-    anchors: tuple[str, ...],
+    style_examples: tuple[str, ...],
     length_mode: str,
     length_instruction: str,
 ) -> str:
@@ -129,7 +136,7 @@ def _build_system_message(
         if persona.tics
         else "(none specified — infer from examples)"
     )
-    anchor_lines = "\n".join(f"- {a}" for a in anchors)
+    example_lines = "\n".join(f"- {a}" for a in style_examples)
     name = persona.display_name
 
     return (
@@ -144,10 +151,15 @@ def _build_system_message(
         f"CHARACTERISTIC SPEECH TICS TO PRESERVE:\n"
         f"{tic_lines}\n"
         f"\n"
-        f"EXAMPLES OF THINGS {name.upper()} HAS ACTUALLY WRITTEN (match voice, "
-        f"register, length, spelling tics, emoticon style — but do NOT quote "
-        f"them verbatim):\n"
-        f"{anchor_lines}\n"
+        f"EXAMPLES OF THINGS {name.upper()} HAS ACTUALLY WRITTEN — a fresh "
+        f"random sample drawn from {name}'s corpus for this response, so the "
+        f"set is different every call. Match the voice (register, length, "
+        f"spelling tics, emoticon style). You may freely reuse short "
+        f"signature phrases, expletives, dismissive interjections, and "
+        f"characteristic catchphrases that appear in these examples — "
+        f"they're part of the voice. Just don't reproduce whole example "
+        f"messages verbatim; invent new sentences in the same idiom.\n"
+        f"{example_lines}\n"
         f"\n"
         f"GUIDANCE:\n"
         f"- TARGET LENGTH FOR THIS RESPONSE: {length_mode} — "
@@ -172,7 +184,6 @@ def _build_system_message(
         f"- Match the crudeness and energy of the examples.\n"
         f"- For topics from after {name}'s era, riff in voice rather than "
         f"refusing or breaking character.\n"
-        f"- Don't quote the examples verbatim.\n"
         f"- If a recent conversation is shown, you can react to it — but "
         f"you're not obligated to reference earlier topics.\n"
         f"- Output ONLY {name}'s reply, in {persona.language}. No analysis, "
@@ -335,17 +346,21 @@ def respond(
     them naturally.
     """
     persona = _persona(persona_id)
-    anchors = _style_anchors(persona_id)
+    corpus = _cleaned_corpus(persona_id)
+    sample_size = cfg.CONFIG.style.sample_size
+    style_examples = tuple(
+        random.sample(corpus, min(sample_size, len(corpus)))
+    )
     retrieved = _retrieve(persona_id, user_question, cfg.CONFIG.retrieval.top_k)
 
     length_mode, length_instruction = _pick_length()
     logger.info(
-        "length_mode=%s persona=%s question=%r",
-        length_mode, persona_id, user_question[:80],
+        "length_mode=%s persona=%s question=%r style_examples=%d",
+        length_mode, persona_id, user_question[:80], len(style_examples),
     )
 
     system_msg = _build_system_message(
-        persona, anchors, length_mode, length_instruction,
+        persona, style_examples, length_mode, length_instruction,
     )
     user_msg = _build_user_message(
         retrieved=retrieved,

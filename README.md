@@ -61,18 +61,14 @@ cp -r personas/_example personas/your-id
 # 4. Clean the raw corpus
 uv run python -m discord_llm_friends.pipeline.cleanup --persona your-id
 
-# 5. Open personas/your-id/cleaned.json and hand-pick 40-60 entries that
-#    cover the persona's voice. Save them as
-#    personas/your-id/style_anchors.json (same JSON-array-of-strings format).
-
-# 6. Embed the cleaned corpus into ChromaDB
+# 5. Embed the cleaned corpus into ChromaDB
 uv run python -m discord_llm_friends.pipeline.embed --persona your-id
 
-# 7. Create a Discord application at
+# 6. Create a Discord application at
 #    https://discord.com/developers/applications, generate a bot token,
 #    and add it to .env as DISCORD_TOKEN_<UPPER_ID> (e.g. DISCORD_TOKEN_YOUR_ID).
 
-# 8. Test, then deploy
+# 7. Test, then deploy
 uv run python -m discord_llm_friends.dev.cli --persona your-id "Test question?"
 uv run python -m discord_llm_friends.bot --persona your-id
 ```
@@ -138,14 +134,18 @@ docs/adr/                          # architectural decision records
 
 ## Architecture in one paragraph
 
-A persona's voice comes from two ingredients in the LLM system prompt:
-the **tics + description** (general voice rules) and the **style anchors**
-(40-60 verbatim examples). On each query, we additionally retrieve the
-top-K most similar entries from the persona's full cleaned corpus via
-ChromaDB and inject them as "things this persona has said about similar
-topics". Recent in-channel exchanges from other personas are also
-included so personas can react to each other. See `engine.py` for the
-prompt assembly.
+A persona's voice is assembled per query from three ingredients in the
+LLM system prompt: the **tics + description** (general voice rules), a
+fresh random **voice sample** drawn from the persona's cleaned corpus on
+every call (50 entries by default, tunable via `style.sample_size` in
+`config.yaml`), and the top-K most similar entries from that same corpus
+retrieved via ChromaDB and injected as "things this persona has said
+about similar topics". Re-sampling the voice block per call is what
+keeps signature catchphrases from dominating every response — they
+appear in roughly the proportion they exist in the corpus. Recent
+in-channel exchanges from other personas are also included so personas
+can react to each other. See `engine.py` for the prompt assembly and
+[CONTEXT.md](./CONTEXT.md) for the domain vocabulary.
 
 ## Deploying to a Linux VM (e.g. Google Cloud e2-micro)
 

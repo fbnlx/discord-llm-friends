@@ -42,6 +42,14 @@ retrieval:
   # How many ChromaDB hits to pull per query, before assembling the prompt.
   top_k: 10
 
+# Style examples (per-response random sampling) -----------------------
+# On each response the engine draws a fresh random subset of cleaned-
+# corpus entries and embeds them in the system prompt.
+style:
+  # How many cleaned-corpus entries to sample per response. Higher =
+  # richer voice exposure; lower = leaner prompt.
+  sample_size: 50
+
 # Bot runtime ----------------------------------------------------------
 bot:
   # Per-user short-window anti-spam, in seconds.

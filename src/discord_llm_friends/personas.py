@@ -4,8 +4,9 @@ Each persona is a folder containing:
   persona.yaml        — structured config (this module parses it)
   description.md      — long-form prose, appended to the system prompt
   raw.json            — input corpus (pipeline input)
-  cleaned.json        — pipeline output (engine input)
-  style_anchors.json  — hand-curated examples (engine input)
+  cleaned.json        — pipeline output (engine input; both the RAG
+                        index source AND the per-call style-example
+                        sampling pool)
 
 A persona id is the folder name. `_example` is shipped with the repo as
 the format reference; `discover()` excludes it by default so `--all`
@@ -67,10 +68,6 @@ class Persona:
     @property
     def cleaned_path(self) -> Path:
         return self.folder / "cleaned.json"
-
-    @property
-    def style_anchors_path(self) -> Path:
-        return self.folder / "style_anchors.json"
 
 
 # --- Loader -----------------------------------------------------------------
@@ -155,16 +152,16 @@ def discover(*, include_example: bool = False, base_dir: Path | None = None) -> 
     return ids
 
 
-def load_style_anchors(persona: Persona) -> list[str]:
-    """Read the persona's hand-curated style anchors. Raises if absent."""
-    if not persona.style_anchors_path.exists():
+def load_cleaned(persona: Persona) -> list[str]:
+    """Read the persona's cleaned corpus. Raises if absent."""
+    if not persona.cleaned_path.exists():
         raise FileNotFoundError(
-            f"style anchors missing: {persona.style_anchors_path}\n"
-            f"Curate {persona.style_anchors_path.relative_to(cfg.ROOT)} "
-            f"(40-60 strings hand-picked from {persona.cleaned_path.name}) "
-            f"before calling the engine."
+            f"cleaned corpus missing: {persona.cleaned_path}\n"
+            f"Run the cleanup pipeline to produce "
+            f"{persona.cleaned_path.relative_to(cfg.ROOT)} from "
+            f"{persona.raw_path.name} before starting the bot."
         )
-    return json.loads(persona.style_anchors_path.read_text(encoding="utf-8"))
+    return json.loads(persona.cleaned_path.read_text(encoding="utf-8"))
 
 
 def resolved_min_words(persona: Persona) -> int:

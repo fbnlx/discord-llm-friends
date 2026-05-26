@@ -72,6 +72,7 @@ class BotConfig:
     daily_limit_per_user: int = 50
     max_discord_message_chars: int = 1900
     history_turns_in_prompt: int = 3
+    echo_question_in_response: bool = True
 
 
 @dataclass(frozen=True)

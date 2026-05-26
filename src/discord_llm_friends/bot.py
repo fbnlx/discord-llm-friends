@@ -245,7 +245,22 @@ def build_client(persona: Persona) -> discord.Client:
                 except Exception:
                     logger.exception("failed to persist exchange to history")
 
-            for chunk in _split_for_discord(response_text, bot_cfg.max_discord_message_chars):
+            # Optionally echo the user's question as a Discord quote-block
+            # at the top of the response.
+            if bot_cfg.echo_question_in_response:
+                echo_text = (
+                    question if len(question) <= 350 else question[:347] + "…"
+                )
+                echo_lines = [
+                    f"> **{line}**" if line.strip() else ">"
+                    for line in (echo_text.splitlines() or [echo_text])
+                ]
+                echo = "\n".join(echo_lines)
+                message_body = f"{echo}\n{response_text}"
+            else:
+                message_body = response_text
+
+            for chunk in _split_for_discord(message_body, bot_cfg.max_discord_message_chars):
                 await interaction.followup.send(chunk)
 
         except Exception:

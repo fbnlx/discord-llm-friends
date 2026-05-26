@@ -54,6 +54,10 @@ bot:
   # Recent exchanges from THIS channel to surface in the LLM prompt for
   # cross-bot continuity. Env override: HISTORY_TURNS.
   history_turns_in_prompt: 3
+  # Echo the user's question as a Discord quote-block at the top of the
+  # bot's response. Compensates for Discord no longer showing slash-
+  # command invocations as regular channel messages.
+  echo_question_in_response: true
 
 # Per-channel conversation history -------------------------------------
 history:

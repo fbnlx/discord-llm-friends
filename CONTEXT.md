@@ -27,6 +27,18 @@ over time. Subset size is set by `style.sample_size` in `config.yaml`
 (default 50). Not persisted; lives only as the prompt body for one call.
 _Avoid_: anchor, style example, sample (alone)
 
+**Synthetic query**:
+A one-line LLM-generated string that hypothesizes what user question,
+topic, or trigger would plausibly prompt a given **Corpus** entry as a
+reply. One per **Corpus** entry, position-aligned in
+`synthetic_queries.json`. The embed pipeline vectorizes the **Synthetic
+queries** (not the original **Corpus** entries) into ChromaDB, shifting
+the retrieval vector space from answer-shaped to question-shaped — better
+recall when the user asks a Discord question that doesn't lexically
+overlap with the source forum-comment register. This is the doc2query
+indexing technique.
+_Avoid_: trigger, prompt, query (alone)
+
 **Tic**:
 A short prose description of a characteristic speech pattern of a **Persona**
 (emoticon style, spelling quirks, register). Listed in `persona.yaml` and
@@ -42,7 +54,8 @@ _Avoid_: filter, rule
 
 **Pipeline**:
 The one-shot sequence run when onboarding a **Persona**: define persona →
-add raw → cleanup → embed. Distinct from **Runtime**.
+add raw → cleanup → generate **Synthetic queries** → embed. Distinct
+from **Runtime**.
 _Avoid_: setup, workflow
 
 **Runtime**:
@@ -58,6 +71,9 @@ _Avoid_: server, app
 - A **Persona** declares a list of **Tics** which are injected into the
   system prompt alongside its **Voice sample**.
 - The **Pipeline** produces the artifacts that the **Runtime** consumes:
-  cleaned **Corpus** → embedded in ChromaDB for RAG retrieval AND
-  randomly sampled per query as the **Voice sample**.
+  cleaned **Corpus** → one **Synthetic query** per entry → embedded
+  (synth queries vectorized, original **Corpus** stored as the
+  retrieval document) in ChromaDB for RAG retrieval. The cleaned
+  **Corpus** is also randomly sampled per query at **Runtime** as the
+  **Voice sample**.
 - Each **Persona** maps to exactly one Discord slash command at **Runtime**.

@@ -56,7 +56,7 @@ class LLMConfig:
 
 @dataclass(frozen=True)
 class EmbeddingConfig:
-    model: str = "text-embedding-3-small"
+    model: str = "text-embedding-3-large"
     batch_size: int = 100
     max_retries: int = 5
 
@@ -64,6 +64,30 @@ class EmbeddingConfig:
 @dataclass(frozen=True)
 class RetrievalConfig:
     top_k: int = 10
+
+
+@dataclass(frozen=True)
+class SynthQueriesConfig:
+    """Knobs for the doc2query synthetic-query generation pipeline step.
+
+    For each cleaned-corpus entry, asks Gemini for a one-line synthetic
+    user-question / topic / trigger that would plausibly prompt that
+    comment as a reply. The embed step then vectorizes these synthetic
+    queries instead of the comments themselves, shifting the embedding
+    space from answer-shaped to question-shaped (better Hungarian recall
+    on the runtime question → corpus matching path).
+    """
+    # Cleaned-corpus entries bundled per LLM call. Higher = fewer
+    # requests, more risk of structured-output drift at the edges.
+    batch_size: int = 20
+    # Concurrent in-flight LLM requests. Bounded by Gemini RPM quota —
+    # lower this if you see 429s in the logs.
+    concurrency: int = 5
+    # Per-request retry budget on transient failures.
+    max_retries: int = 5
+    # Override the output language for generated queries. If None, the
+    # persona's `language` field is used (recommended).
+    output_language: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +132,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    synth_queries: SynthQueriesConfig = field(default_factory=SynthQueriesConfig)
     style: StyleConfig = field(default_factory=StyleConfig)
     bot: BotConfig = field(default_factory=BotConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
@@ -140,6 +165,7 @@ def load_config(path: Path | None = None) -> Config:
             llm=_override(cfg.llm, data.get("llm")),
             embedding=_override(cfg.embedding, data.get("embedding")),
             retrieval=_override(cfg.retrieval, data.get("retrieval")),
+            synth_queries=_override(cfg.synth_queries, data.get("synth_queries")),
             style=_override(cfg.style, data.get("style")),
             bot=_override(cfg.bot, data.get("bot")),
             history=_override(cfg.history, data.get("history")),

@@ -178,9 +178,14 @@ def _build_system_message(
         f"unless the user's question already mentions them. The persona "
         f"has many interests; resist the urge to advertise them in every "
         f"response.\n"
-        f"- The retrieved examples in the user message show how {name} "
-        f"talks (vocabulary, register, emoticons). They are STYLE "
-        f"reference, not a topic menu.\n"
+        f"- The user message includes real past comments by {name} "
+        f"retrieved as relevant to this question — they carry {name}'s "
+        f"actual opinions and knowledge on the topic. Where one genuinely "
+        f"fits, lean on it for the SUBSTANCE of your answer (the stance, "
+        f"the take, the facts), not merely the wording. Judge each one and "
+        f"ignore the off-topic ones rather than forcing them in. (The "
+        f"random style examples above however are mostly voice reference, "
+        f"but feel free to use facts from them if relevant)\n"
         f"- Match the crudeness and energy of the examples.\n"
         f"- For topics from after {name}'s era, riff in voice rather than "
         f"refusing or breaking character.\n"
@@ -218,8 +223,14 @@ def _build_user_message(
     if retrieved:
         retrieved_block = "\n".join(f"- {r}" for r in retrieved)
         sections.append(
-            f"HOW {name.upper()} TALKS (style/vocabulary reference — match "
-            f"the voice, not the topics):\n{retrieved_block}"
+            f"WHAT {name.upper()} HAS SAID ABOUT THIS TOPIC (real past "
+            f"comments retrieved as relevant to the question — they capture "
+            f"{name}'s genuine opinions and knowledge here). Where any of "
+            f"these is actually relevant, use it as inspiration for the "
+            f"SUBSTANCE of your answer — the stance, the take, the facts — "
+            f"not just the voice. Skip any that turn out off-topic, and "
+            f"rephrase in the moment rather than quoting verbatim:\n"
+            f"{retrieved_block}"
         )
 
     asker_prefix = f" (from @{asker_name})" if asker_name else ""

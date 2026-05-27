@@ -12,7 +12,7 @@ architectural decisions worth their own writeup.
 
 - Python 3.12+ managed by [uv](https://github.com/astral-sh/uv)
 - LLMs: Gemini (default), Claude, or OpenAI — selectable in `config.yaml`
-- Embeddings: OpenAI `text-embedding-3-small`
+- Embeddings: OpenAI `text-embedding-3-large`
 - Vector store: ChromaDB, local, file-backed at `./chroma/`
 - Discord: `discord.py`
 
@@ -34,8 +34,9 @@ cp .env.example .env
 # run Marv in a real Discord server.
 
 # 3. Run the pipeline against Marv
-uv run python -m discord_llm_friends.pipeline.cleanup --persona _example
-uv run python -m discord_llm_friends.pipeline.embed   --persona _example
+uv run python -m discord_llm_friends.pipeline.cleanup      --persona _example
+uv run python -m discord_llm_friends.pipeline.synth_queries --persona _example
+uv run python -m discord_llm_friends.pipeline.embed        --persona _example
 
 # 4. Test from the terminal (no Discord needed)
 uv run python -m discord_llm_friends.dev.cli --persona _example "Why is the slam switch always the answer?"
@@ -61,14 +62,20 @@ cp -r personas/_example personas/your-id
 # 4. Clean the raw corpus
 uv run python -m discord_llm_friends.pipeline.cleanup --persona your-id
 
-# 5. Embed the cleaned corpus into ChromaDB
+# 5. Generate synthetic queries (doc2query indexing — one LLM-generated
+#    "what would prompt this comment?" line per cleaned entry). Output:
+#    personas/your-id/synthetic_queries.json. Resumable; re-run anytime.
+uv run python -m discord_llm_friends.pipeline.synth_queries --persona your-id
+
+# 6. Embed into ChromaDB. Picks up synthetic_queries.json automatically;
+#    pass --no-synth to embed cleaned text directly instead.
 uv run python -m discord_llm_friends.pipeline.embed --persona your-id
 
-# 6. Create a Discord application at
+# 7. Create a Discord application at
 #    https://discord.com/developers/applications, generate a bot token,
 #    and add it to .env as DISCORD_TOKEN_<UPPER_ID> (e.g. DISCORD_TOKEN_YOUR_ID).
 
-# 7. Test, then deploy
+# 8. Test, then deploy
 uv run python -m discord_llm_friends.dev.cli --persona your-id "Test question?"
 uv run python -m discord_llm_friends.bot --persona your-id
 ```
@@ -92,12 +99,12 @@ malformed `persona.yaml`.
 
 ## Configuration
 
-| File | Purpose | Tracked in git? |
-|---|---|---|
-| `config.yaml` | Project-wide tunables (LLM provider, retrieval count, rate limits, history retention). Layered defaults — only override what you want to change. | yes |
-| `.env`        | Secrets (API keys, Discord tokens). Also accepts env-var overrides for `LLM_PROVIDER`, `DAILY_LIMIT`, `HISTORY_TURNS`. | no |
-| `personas/<id>/persona.yaml` | Per-persona config: name, language, tics, fallback/quota messages, Discord wiring, cleanup overrides. | only `_example/` |
-| `personas/<id>/description.md` | Long-form prose description appended into the system prompt. | only `_example/` |
+| File                           | Purpose                                                                                                                                          | Tracked in git?  |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------- |
+| `config.yaml`                  | Project-wide tunables (LLM provider, retrieval count, rate limits, history retention). Layered defaults — only override what you want to change. | yes              |
+| `.env`                         | Secrets (API keys, Discord tokens). Also accepts env-var overrides for `LLM_PROVIDER`, `DAILY_LIMIT`, `HISTORY_TURNS`.                           | no               |
+| `personas/<id>/persona.yaml`   | Per-persona config: name, language, tics, fallback/quota messages, Discord wiring, cleanup overrides.                                            | only `_example/` |
+| `personas/<id>/description.md` | Long-form prose description appended into the system prompt.                                                                                     | only `_example/` |
 
 Open `personas/_example/persona.yaml` for an annotated reference. The
 `config.yaml` shipped at the repo root contains commented defaults for
@@ -123,7 +130,8 @@ src/discord_llm_friends/
   personas.py                      # persona loader
   pipeline/
     cleanup.py                     # raw.json → cleaned.json
-    embed.py                       # cleaned.json → ChromaDB
+    synth_queries.py               # cleaned.json → synthetic_queries.json (doc2query, Gemini)
+    embed.py                       # cleaned.json + synthetic_queries.json → ChromaDB
   dev/
     cli.py                         # ad-hoc Q&A
     query_check.py                 # preview retrieval results
@@ -142,10 +150,20 @@ every call (50 entries by default, tunable via `style.sample_size` in
 retrieved via ChromaDB and injected as "things this persona has said
 about similar topics". Re-sampling the voice block per call is what
 keeps signature catchphrases from dominating every response — they
-appear in roughly the proportion they exist in the corpus. Recent
-in-channel exchanges from other personas are also included so personas
-can react to each other. See `engine.py` for the prompt assembly and
-[CONTEXT.md](./CONTEXT.md) for the domain vocabulary.
+appear in roughly the proportion they exist in the corpus.
+
+Retrieval uses **doc2query indexing**: instead of embedding the cleaned
+comments directly, an offline pipeline step (`pipeline.synth_queries`)
+asks Gemini for a one-line "what question/topic would prompt this comment
+as a reply?" per entry. The embed step vectorizes those synthetic
+queries (storing the original comments as the retrieval documents), so
+the embedding vector space is question-shaped — a big win on languages
+where small embedders struggle to bridge the declarative-vs-interrogative
+asymmetry between corpus entries and Discord user questions.
+
+Recent in-channel exchanges from other personas are also included so
+personas can react to each other. See `engine.py` for the prompt
+assembly and [CONTEXT.md](./CONTEXT.md) for the domain vocabulary.
 
 ## Deploying to a Linux VM (e.g. Google Cloud e2-micro)
 
@@ -156,12 +174,14 @@ The repo ships with a sample systemd unit at
    constraint, which is why the runtime is single-process (see ADR-0003).
 
 2. **Install system deps + uv:**
+
    ```sh
    sudo apt update && sudo apt install -y git python3 python3-venv curl
    curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
 
 3. **Create an unprivileged user and clone the repo:**
+
    ```sh
    sudo useradd --system --create-home --home-dir /opt/discord-llm-friends \
      --shell /usr/sbin/nologin discord-llm-friends
@@ -173,12 +193,14 @@ The repo ships with a sample systemd unit at
 4. **Get your personas onto the host.** Either define them directly on
    the VM, or `rsync` your `personas/<id>/` folders from your laptop.
    Run cleanup + embed once per persona to populate ChromaDB:
+
    ```sh
    sudo -u discord-llm-friends uv run python -m discord_llm_friends.pipeline.cleanup --persona <id>
    sudo -u discord-llm-friends uv run python -m discord_llm_friends.pipeline.embed   --persona <id>
    ```
 
 5. **Create the `.env` file with secrets, locked down:**
+
    ```sh
    sudo -u discord-llm-friends cp .env.example .env
    sudo -u discord-llm-friends nano .env
@@ -187,6 +209,7 @@ The repo ships with a sample systemd unit at
 
 6. **Install the systemd unit** after substituting the paths in it for
    your host (User, WorkingDirectory, ExecStart):
+
    ```sh
    sudo cp deploy/discord-llm-friends.service /etc/systemd/system/
    sudo systemctl daemon-reload
@@ -202,6 +225,7 @@ The repo ships with a sample systemd unit at
    ```
 
 Notes:
+
 - Traffic is purely outbound HTTPS (Discord + LLM provider + OpenAI for
   embeddings). No inbound ports need opening — keep the VM's firewall
   locked down.

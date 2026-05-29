@@ -24,13 +24,22 @@ llm:
     claude: claude-haiku-4-5
     openai: gpt-5.4
 
+  # Failover chain. If the selected provider errors (e.g. a 503 "model is
+  # overloaded", a rate limit, or a blocked/empty response), the engine
+  # retries the request on the next provider in this list, skipping the
+  # one that just failed. With provider=gemini above, the order tried is
+  # gemini -> openai -> claude. The substitute provider's own API key must
+  # be set in .env for it to take over. Set to [] to disable failover and
+  # let the selected provider's error propagate.
+  fallback_order: [gemini, openai, claude]
+
   # Generation knobs applied uniformly across providers.
   temperature: 0.9
   max_output_tokens: 2000
 
 # Embeddings (always OpenAI; project decision) --------------------------
 embedding:
-  model: text-embedding-3-small
+  model: text-embedding-3-large
   # Embed pipeline batch size. OpenAI accepts much larger; 100 gives useful
   # progress output and bounds blast radius if a single batch fails.
   batch_size: 100
@@ -41,6 +50,20 @@ embedding:
 retrieval:
   # How many ChromaDB hits to pull per query, before assembling the prompt.
   top_k: 10
+
+# Synthetic-query generation (doc2query indexing) ---------------------
+# Pipeline step between cleanup and embed. For each cleaned-corpus
+# entry, asks Gemini for a one-line "what question/topic would prompt
+# this comment as a reply?" string. embed then vectorizes THOSE
+# strings instead of the original comments, so the runtime embedding
+# space is question-shaped (better Hungarian recall). Sidecar:
+# personas/<id>/synthetic_queries.json (parallel array, same length
+# and order as cleaned.json). See pipeline.synth_queries.
+synth_queries:
+  batch_size: 20         # comments bundled into one LLM call
+  concurrency: 5         # in-flight requests; lower if you see 429s
+  max_retries: 5
+  output_language: null  # null = take from persona.language
 
 # Style examples (per-response random sampling) -----------------------
 # On each response the engine draws a fresh random subset of cleaned-

@@ -9,7 +9,8 @@ Pipeline:
   3. Query the persona's ChromaDB collection for top-K relevant comments.
   4. Assemble a system prompt (who they are + style examples) and a user
      prompt (retrieved comments + recent channel history + the question).
-  5. Dispatch to the LLM provider selected by CONFIG.llm.provider.
+  5. Dispatch to the LLM provider selected by CONFIG.llm.provider,
+     failing over to the next provider in CONFIG.llm.fallback_order on error.
   6. Return the generated response string.
 
 Env-only knobs (no YAML equivalent):
@@ -250,21 +251,6 @@ def _maybe_log_prompt(system: str, user: str) -> None:
 
 # --- LLM dispatch ----------------------------------------------------------
 
-def call_llm(system: str, user: str) -> str:
-    """Dispatch to the provider selected by CONFIG.llm.provider."""
-    provider = cfg.CONFIG.llm.provider
-    if provider == "gemini":
-        return _call_gemini(system, user)
-    if provider == "claude":
-        return _call_claude(system, user)
-    if provider == "openai":
-        return _call_openai(system, user)
-    raise ValueError(
-        f"unknown LLM provider {provider!r} — expected one of "
-        f"{sorted(cfg.CONFIG.llm.models)}"
-    )
-
-
 def _call_gemini(system: str, user: str) -> str:
     if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
         raise RuntimeError("GOOGLE_API_KEY (or GEMINI_API_KEY) not set")
@@ -339,6 +325,71 @@ def _call_openai(system: str, user: str) -> str:
             f"OpenAI returned empty content. finish_reason={resp.choices[0].finish_reason!r}"
         )
     return text.strip()
+
+
+# Single source of truth for which providers exist. call_llm() builds its
+# failover chain from this map plus CONFIG.llm.fallback_order.
+_PROVIDERS = {
+    "gemini": _call_gemini,
+    "claude": _call_claude,
+    "openai": _call_openai,
+}
+
+
+def _provider_chain() -> list[str]:
+    """Ordered providers to attempt: the configured `provider` first, then
+    `CONFIG.llm.fallback_order`, skipping already-included and unknown names.
+    """
+    primary = cfg.CONFIG.llm.provider
+    if primary not in _PROVIDERS:
+        raise ValueError(
+            f"unknown LLM provider {primary!r} — expected one of "
+            f"{sorted(_PROVIDERS)}"
+        )
+    chain = [primary]
+    for provider in cfg.CONFIG.llm.fallback_order:
+        if provider in _PROVIDERS and provider not in chain:
+            chain.append(provider)
+    return chain
+
+
+def call_llm(system: str, user: str) -> str:
+    # Calls the configured LLM provider, failing over to the next on error.
+    chain = _provider_chain()
+    errors: list[str] = []
+    last_exc: Exception | None = None
+    for index, provider in enumerate(chain):
+        try:
+            text = _PROVIDERS[provider](system, user)
+        except Exception as exc:
+            # Catch-all is deliberate: any provider error triggers failover,
+            # not just availability errors. The accumulated summary is
+            # raised only if we exhaust the chain.
+            last_exc = exc
+            errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+            nxt = chain[index + 1] if index + 1 < len(chain) else None
+            if nxt is not None:
+                logger.warning(
+                    "LLM provider %r failed (%s: %s) — failing over to %r",
+                    provider, type(exc).__name__, exc, nxt,
+                )
+            else:
+                logger.error(
+                    "LLM provider %r failed (%s: %s) — no providers left",
+                    provider, type(exc).__name__, exc,
+                )
+            continue
+        if index > 0:
+            logger.info("LLM provider %r succeeded after failover", provider)
+        return text
+    # Chain exhausted. With a single provider (failover disabled, or no other
+    # known provider configured), re-raise its error unwrapped so the original
+    # propagates cleanly. With several, raise a summary chained to the last.
+    if len(chain) == 1 and last_exc is not None:
+        raise last_exc
+    raise RuntimeError(
+        "all LLM providers failed — " + " | ".join(errors)
+    ) from last_exc
 
 
 # --- Public entry point ----------------------------------------------------

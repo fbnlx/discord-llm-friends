@@ -50,6 +50,9 @@ class LLMConfig:
         "claude": "claude-haiku-4-5",
         "openai": "gpt-5.4",
     })
+    fallback_order: list[str] = field(default_factory=lambda: [
+        "gemini", "openai", "claude",
+    ])
     temperature: float = 0.6
     max_output_tokens: int = 2000
 

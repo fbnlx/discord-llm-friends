@@ -66,7 +66,21 @@ class EmbeddingConfig:
 
 @dataclass(frozen=True)
 class RetrievalConfig:
-    top_k: int = 10
+    # Window/excerpt budget per query (stance cards get their own slots in the
+    # engine, STANCE_SLOTS). Each candidate must ALSO clear the distance floor.
+    top_k: int = 4
+    # L2-distance floors: a hit farther than this is dropped rather than
+    # injected as filler. Cards (synthesized, clean) get a looser floor than
+    # windows (noisy multi-speaker excerpts). When nothing clears the floor the
+    # prompt falls back to the always-present dossier. Tune by reading
+    # dev.query_check distances on known-relevant vs irrelevant queries.
+    max_card_distance: float = 0.80
+    max_window_distance: float = 0.60
+    # Added to both floors ONLY on the query-expansion retry. The first pass
+    # found nothing clean, so on the retry we accept a looser match from the
+    # neutral rephrasing (e.g. crude slang that only reaches ~0.83) rather than
+    # inject nothing — while still excluding outright noise (~0.92+).
+    expanded_floor_bonus: float = 0.08
 
 
 @dataclass(frozen=True)

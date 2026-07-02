@@ -3,12 +3,17 @@
 Public entry point: `respond(persona_id, question, ...)`.
 
 Pipeline:
-  1. Load the persona's description + tics, and draw a fresh random
-     sample of style examples from the cleaned corpus.
+  1. Load the persona's description + dossier + tics, and draw a fresh
+     random sample of style examples from the voice pool (voice_pool.json
+     if present, else the cleaned corpus).
   2. Embed the user's question with the embedding model in CONFIG.
-  3. Query the persona's ChromaDB collection for top-K relevant comments.
-  4. Assemble a system prompt (who they are + style examples) and a user
-     prompt (retrieved comments + recent channel history + the question).
+  3. Query the persona's ChromaDB collection, overfetching because several
+     synthetic queries can point at the same unit; dedup to unique units
+     and split them into stance cards (distilled opinions) vs excerpts
+     (comments / group-chat windows).
+  4. Assemble a system prompt (who they are + dossier + style examples)
+     and a user prompt (stances + excerpts + recent channel history + the
+     question).
   5. Dispatch to the LLM provider selected by CONFIG.llm.provider,
      failing over to the next provider in CONFIG.llm.fallback_order on error.
   6. Return the generated response string.
@@ -98,30 +103,161 @@ def _persona(persona_id: str) -> personas_module.Persona:
 
 
 @lru_cache(maxsize=16)
-def _cleaned_corpus(persona_id: str) -> tuple[str, ...]:
-    """Load the persona's cleaned corpus once and cache it.
+def _voice_pool(persona_id: str) -> tuple[str, ...]:
+    """Load the persona's voice pool once and cache it.
 
     Used as the pool for per-call style-example sampling — each
     `respond()` draws a fresh random subset from this tuple, so the
     system prompt shows different examples on every query. Returns a
     tuple so it's hashable for lru_cache and immutable to callers.
     """
-    return tuple(personas_module.load_cleaned(_persona(persona_id)))
+    return tuple(personas_module.load_voice_pool(_persona(persona_id)))
 
 
 # --- Retrieval -------------------------------------------------------------
 
-def _retrieve(persona_id: str, question: str, n: int) -> list[str]:
-    """Embed the question and pull top-N nearest stored comments."""
-    embed_resp = _openai_client().embeddings.create(
-        model=cfg.CONFIG.embedding.model,
-        input=[question],
-    )
-    query_vec = embed_resp.data[0].embedding
+# How many stance cards (distilled cross-session opinions, metadata
+# type="stance") to inject on top of the excerpt budget. Cards are dense —
+# one card answers "what does X think about this" wholesale — so a couple
+# is plenty; excerpts carry the authentic texture.
+STANCE_SLOTS = 2
 
+
+def _retrieve(
+    persona_id: str, queries: list[str], n: int, floor_bonus: float = 0.0,
+) -> tuple[list[str], list[str]]:
+    """Embed the query phrasing(s) and pull the nearest stored units.
+
+    `queries` is one or more phrasings of the user's question — more than one
+    only when runtime query expansion kicks in. Each unit is scored by its
+    BEST (nearest) distance across all phrasings, so an added neutral
+    rephrasing can rescue a card a slangy phrasing missed. `floor_bonus` is
+    added to both distance floors (the expansion retry passes a small bonus to
+    accept a looser match rather than nothing).
+
+    Returns (stances, excerpts): up to STANCE_SLOTS stance cards and up to
+    `n` excerpts (forum comments / group-chat windows), nearest first — each
+    within its per-type L2 distance floor (CONFIG.retrieval), so a query with
+    no genuinely close hit injects little or nothing and the always-present
+    dossier carries the answer instead of irrelevant filler.
+
+    The collection holds several rows per unit (one per synthetic query
+    pointing at it), so hits are deduped by unit id — card_id / window_id
+    metadata when present, the document text itself for legacy comment rows.
+    """
+    query_vecs = [
+        d.embedding
+        for d in _openai_client().embeddings.create(
+            model=cfg.CONFIG.embedding.model, input=queries,
+        ).data
+    ]
+
+    rc = cfg.CONFIG.retrieval
     collection = _chroma_client().get_collection(name=persona_id)
-    result = collection.query(query_embeddings=[query_vec], n_results=n)
-    return result["documents"][0]
+    overfetch = min((n + STANCE_SLOTS) * 4, collection.count())
+    result = collection.query(
+        query_embeddings=query_vecs,
+        n_results=overfetch,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    # Merge across phrasings: keep each unit's nearest distance, deduped by id.
+    best: dict[str, tuple[float, str, dict]] = {}
+    for qi in range(len(query_vecs)):
+        for doc, meta, dist in zip(
+            result["documents"][qi], result["metadatas"][qi], result["distances"][qi]
+        ):
+            meta = meta or {}
+            unit = meta.get("card_id") or meta.get("window_id") or doc
+            if unit not in best or dist < best[unit][0]:
+                best[unit] = (dist, doc, meta)
+
+    card_floor = rc.max_card_distance + floor_bonus
+    window_floor = rc.max_window_distance + floor_bonus
+    stances: list[str] = []
+    excerpts: list[str] = []
+    nearest_card = nearest_window = None
+    dropped_card = dropped_window = 0
+    # Nearest first. A hit beyond its type's distance floor is dropped, not
+    # injected — better to send nothing (and lean on the dossier) than to pad
+    # the prompt with irrelevant excerpts. Cards get a looser floor than
+    # windows (cleaner, fewer, denser).
+    for dist, doc, meta in sorted(best.values(), key=lambda x: x[0]):
+        is_stance = meta.get("type") == "stance"
+        if is_stance and nearest_card is None:
+            nearest_card = dist
+        if not is_stance and nearest_window is None:
+            nearest_window = dist
+        if dist > (card_floor if is_stance else window_floor):
+            if is_stance:
+                dropped_card += 1
+            else:
+                dropped_window += 1
+            continue
+        if is_stance:
+            if len(stances) < STANCE_SLOTS:
+                stances.append(doc)
+        elif len(excerpts) < n:
+            excerpts.append(doc)
+
+    logger.info(
+        "retrieval persona=%s phrasings=%d kept_stances=%d kept_excerpts=%d "
+        "nearest_card=%s nearest_window=%s dropped_beyond_floor=%d/%d(card/window)",
+        persona_id, len(queries), len(stances), len(excerpts),
+        f"{nearest_card:.3f}" if nearest_card is not None else "na",
+        f"{nearest_window:.3f}" if nearest_window is not None else "na",
+        dropped_card, dropped_window,
+    )
+    if DEBUG_PROMPT or DRY_RUN:
+        nc = f"{nearest_card:.3f}" if nearest_card is not None else "—"
+        nw = f"{nearest_window:.3f}" if nearest_window is not None else "—"
+        print(
+            f"[retrieval] {len(queries)} phrasing(s); nearest card={nc} "
+            f"(floor {card_floor:.2f}), window={nw} "
+            f"(floor {window_floor:.2f}) → kept {len(stances)} stance / "
+            f"{len(excerpts)} excerpt; dropped {dropped_card} card / "
+            f"{dropped_window} window beyond floor",
+            file=sys.stderr,
+        )
+    return stances, excerpts
+
+
+# Runtime query expansion (conditional). Only fires when the first retrieval
+# pass found nothing within the distance floor — typically a slangy/vulgar
+# phrasing that embeds far from the (cleaner) stored card/window queries. A
+# short rewrite into a few register/topic variants — crucially a NEUTRAL one —
+# bridges the gap; normal queries that already match never pay for the call.
+_EXPANSION_VARIANTS = 3
+
+
+def _expand_query(question: str, persona: personas_module.Persona) -> list[str]:
+    """Rewrite the user's question into a few alternative search phrasings.
+
+    Returns [] on any failure — the caller then just keeps the empty
+    first-pass result and falls back to the dossier.
+    """
+    system = (
+        f"You rewrite a chat message into short {persona.language} search "
+        f"phrasings used to look up {persona.display_name}'s opinions in a "
+        f"database. Output {_EXPANSION_VARIANTS} alternative phrasings of the "
+        f"SAME question, one per line, no numbering, each in "
+        f"{persona.language}. Include at least one NEUTRAL, plain rephrasing "
+        f"that strips slang and vulgarity and names the underlying topic "
+        f"directly (e.g. a crude sexual phrasing becomes 'which women does he "
+        f"find attractive' / 'sexual preferences', expressed in "
+        f"{persona.language}). Keep the others near the original register. "
+        f"Output ONLY the phrasings."
+    )
+    try:
+        text = call_llm(system, question)
+    except Exception:  # noqa: BLE001 — expansion is best-effort; never fatal
+        return []
+    variants = [
+        line.strip(" -•\t").strip()
+        for line in text.splitlines()
+        if line.strip(" -•\t").strip()
+    ]
+    return variants[:_EXPANSION_VARIANTS]
 
 
 # --- Prompt assembly -------------------------------------------------------
@@ -140,6 +276,18 @@ def _build_system_message(
     example_lines = "\n".join(f"- {a}" for a in style_examples)
     name = persona.display_name
 
+    dossier_block = (
+        f"{name.upper()}'S PROFILE — distilled from {name}'s real chat "
+        f"history: personality, recurring opinions, and how {name} treats "
+        f"the other friends. Treat this as reliable background; when the "
+        f"question touches one of these subjects or people, this is "
+        f"{name}'s established take.\n"
+        f"{persona.dossier}\n"
+        f"\n"
+        if persona.dossier
+        else ""
+    )
+
     return (
         f"You are responding AS {name}. Stay completely in character. Respond "
         f"ONLY in {persona.language}, in {name}'s voice. Do not announce "
@@ -149,6 +297,7 @@ def _build_system_message(
         f"WHO {name.upper()} IS:\n"
         f"{persona.description}\n"
         f"\n"
+        f"{dossier_block}"
         f"CHARACTERISTIC SPEECH TICS TO PRESERVE:\n"
         f"{tic_lines}\n"
         f"\n"
@@ -179,14 +328,15 @@ def _build_system_message(
         f"unless the user's question already mentions them. The persona "
         f"has many interests; resist the urge to advertise them in every "
         f"response.\n"
-        f"- The user message includes real past comments by {name} "
-        f"retrieved as relevant to this question — they carry {name}'s "
-        f"actual opinions and knowledge on the topic. Where one genuinely "
-        f"fits, lean on it for the SUBSTANCE of your answer (the stance, "
-        f"the take, the facts), not merely the wording. Judge each one and "
-        f"ignore the off-topic ones rather than forcing them in. (The "
-        f"random style examples above however are mostly voice reference, "
-        f"but feel free to use facts from them if relevant)\n"
+        f"- The user message may include distilled stance summaries and "
+        f"real past material by {name} retrieved as relevant to this "
+        f"question — they carry {name}'s actual opinions and knowledge on "
+        f"the topic. Where one genuinely fits, lean on it for the SUBSTANCE "
+        f"of your answer (the stance, the take, the facts), not merely the "
+        f"wording. Judge each one and ignore the off-topic ones rather than "
+        f"forcing them in. (The random style examples above however are "
+        f"mostly voice reference, but feel free to use facts from them if "
+        f"relevant)\n"
         f"- Match the crudeness and energy of the examples.\n"
         f"- For topics from after {name}'s era, riff in voice rather than "
         f"refusing or breaking character.\n"
@@ -207,7 +357,8 @@ def _format_history(history: list[Exchange]) -> str:
 
 
 def _build_user_message(
-    retrieved: list[str],
+    stances: list[str],
+    excerpts: list[str],
     question: str,
     name: str,
     history: list[Exchange] | None,
@@ -221,17 +372,32 @@ def _build_user_message(
             + _format_history(history)
         )
 
-    if retrieved:
-        retrieved_block = "\n".join(f"- {r}" for r in retrieved)
+    if stances:
+        stance_block = "\n\n".join(stances)
         sections.append(
-            f"WHAT {name.upper()} HAS SAID ABOUT THIS TOPIC (real past "
-            f"comments retrieved as relevant to the question — they capture "
-            f"{name}'s genuine opinions and knowledge here). Where any of "
-            f"these is actually relevant, use it as inspiration for the "
+            f"WHAT {name.upper()} CONSISTENTLY THINKS — distilled stance "
+            f"summaries synthesized from {name}'s whole chat history, "
+            f"retrieved as relevant to this question. These are {name}'s "
+            f"established opinions: rely on them for the SUBSTANCE of the "
+            f"answer (the verdicts, the preferences, the reasons) whenever "
+            f"the question touches them:\n"
+            f"{stance_block}"
+        )
+
+    if excerpts:
+        excerpt_block = "\n".join(f"- {r}" for r in excerpts)
+        sections.append(
+            f"WHAT {name.upper()} HAS SAID ABOUT THIS TOPIC — real past "
+            f"material retrieved as relevant: standalone comments by {name}, "
+            f"and/or excerpts of group conversations {name} took part in "
+            f"(lines formatted '[n] author: text'). In conversation excerpts "
+            f"ONLY the lines written by {name} are {name}'s own words and "
+            f"opinions — the other speakers are context, never voice or "
+            f"stance to absorb. Where relevant, use this material for the "
             f"SUBSTANCE of your answer — the stance, the take, the facts — "
             f"not just the voice. Skip any that turn out off-topic, and "
             f"rephrase in the moment rather than quoting verbatim:\n"
-            f"{retrieved_block}"
+            f"{excerpt_block}"
         )
 
     asker_prefix = f" (from @{asker_name})" if asker_name else ""
@@ -408,24 +574,47 @@ def respond(
     them naturally.
     """
     persona = _persona(persona_id)
-    corpus = _cleaned_corpus(persona_id)
+    corpus = _voice_pool(persona_id)
     sample_size = cfg.CONFIG.style.sample_size
     style_examples = tuple(
         random.sample(corpus, min(sample_size, len(corpus)))
     )
-    retrieved = _retrieve(persona_id, user_question, cfg.CONFIG.retrieval.top_k)
+    stances, excerpts = _retrieve(
+        persona_id, [user_question], cfg.CONFIG.retrieval.top_k,
+    )
+    # Conditional query expansion: only when the first pass found nothing
+    # within the distance floor (e.g. a slangy phrasing that embeds far from
+    # the cleaner stored queries). A neutral rephrasing usually rescues it;
+    # queries that already matched never pay for the extra call. Skipped under
+    # DRY_RUN to keep prompt inspection LLM-free.
+    expanded = False
+    if not stances and not excerpts and not DRY_RUN:
+        variants = _expand_query(user_question, persona)
+        if variants:
+            expanded = True
+            if DEBUG_PROMPT:
+                print(f"[expansion] first pass empty — retrying with {variants}",
+                      file=sys.stderr)
+            stances, excerpts = _retrieve(
+                persona_id, [user_question, *variants],
+                cfg.CONFIG.retrieval.top_k,
+                floor_bonus=cfg.CONFIG.retrieval.expanded_floor_bonus,
+            )
 
     length_mode, length_instruction = _pick_length()
     logger.info(
-        "length_mode=%s persona=%s question=%r style_examples=%d",
+        "length_mode=%s persona=%s question=%r style_examples=%d "
+        "stances=%d excerpts=%d expanded=%s",
         length_mode, persona_id, user_question[:80], len(style_examples),
+        len(stances), len(excerpts), expanded,
     )
 
     system_msg = _build_system_message(
         persona, style_examples, length_mode, length_instruction,
     )
     user_msg = _build_user_message(
-        retrieved=retrieved,
+        stances=stances,
+        excerpts=excerpts,
         question=user_question,
         name=persona.display_name,
         history=history,

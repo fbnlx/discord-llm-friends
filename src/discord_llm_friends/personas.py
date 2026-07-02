@@ -4,9 +4,16 @@ Each persona is a folder containing:
   persona.yaml        — structured config (this module parses it)
   description.md      — long-form prose, appended to the system prompt
   raw.json            — input corpus (pipeline input)
-  cleaned.json        — pipeline output (engine input; both the RAG
-                        index source AND the per-call style-example
-                        sampling pool)
+  cleaned.json        — pipeline output (RAG index source; also the
+                        voice-sample pool when no voice_pool.json exists)
+  voice_pool.json     — optional: explicit voice-sample pool. Personas
+                        whose retrieval documents are NOT all their own
+                        words (group-chat windows) need this split —
+                        sampling multi-speaker excerpts as the persona's
+                        own voice would corrupt the mimicry.
+  dossier.md          — optional: generated identity profile (stances,
+                        relationships) appended to the system prompt
+                        after description.md.
 
 A persona id is the folder name. `_example` is shipped with the repo as
 the format reference; `discover()` excludes it by default so `--all`
@@ -56,6 +63,10 @@ class Persona:
     description: str
     """Full prose content of description.md, used as-is in the system prompt."""
 
+    dossier: str
+    """Full prose content of dossier.md ("" if absent) — generated identity
+    profile appended to the system prompt after the description."""
+
     folder: Path
     """Where this persona lives on disk. Useful for derived paths."""
 
@@ -68,6 +79,10 @@ class Persona:
     @property
     def cleaned_path(self) -> Path:
         return self.folder / "cleaned.json"
+
+    @property
+    def voice_pool_path(self) -> Path:
+        return self.folder / "voice_pool.json"
 
 
 # --- Loader -----------------------------------------------------------------
@@ -114,6 +129,13 @@ def load(persona_id: str, base_dir: Path | None = None) -> Persona:
         else ""
     )
 
+    dossier_path = folder / "dossier.md"
+    dossier = (
+        dossier_path.read_text(encoding="utf-8").strip()
+        if dossier_path.exists()
+        else ""
+    )
+
     try:
         return Persona(
             id=data["id"],
@@ -126,6 +148,7 @@ def load(persona_id: str, base_dir: Path | None = None) -> Persona:
             rate_limit_message=data.get("rate_limit_message", ""),
             cleanup=cleanup,
             description=description,
+            dossier=dossier,
             folder=folder,
         )
     except KeyError as e:
@@ -162,6 +185,15 @@ def load_cleaned(persona: Persona) -> list[str]:
             f"{persona.raw_path.name} before starting the bot."
         )
     return json.loads(persona.cleaned_path.read_text(encoding="utf-8"))
+
+
+def load_voice_pool(persona: Persona) -> list[str]:
+    """The pool the engine samples voice examples from: voice_pool.json
+    when present, else the cleaned corpus (the historical behavior, where
+    cleaned.json served both retrieval and voice)."""
+    if persona.voice_pool_path.exists():
+        return json.loads(persona.voice_pool_path.read_text(encoding="utf-8"))
+    return load_cleaned(persona)
 
 
 def resolved_min_words(persona: Persona) -> int:

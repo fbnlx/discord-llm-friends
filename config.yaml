@@ -48,8 +48,18 @@ embedding:
 
 # Retrieval -------------------------------------------------------------
 retrieval:
-  # How many ChromaDB hits to pull per query, before assembling the prompt.
-  top_k: 10
+  # Window/excerpt budget per query (stance cards get their own 2 slots).
+  top_k: 4
+  # L2-distance floors — hits farther than these are dropped instead of
+  # injected as irrelevant filler. Cards are cleaner, so a looser floor than
+  # noisy multi-speaker windows. Nothing relevant -> fall back to the dossier.
+  # Tune via dev.query_check distances on relevant vs irrelevant queries.
+  max_card_distance: 0.80
+  max_window_distance: 0.70
+  # Added to both floors only on the query-expansion retry (when the first
+  # pass found nothing). Accepts a looser match from the neutral rephrasing
+  # rather than nothing, while still excluding outright noise (~0.92+).
+  expanded_floor_bonus: 0.10
 
 # Synthetic-query generation (doc2query indexing) ---------------------
 # Pipeline step between cleanup and embed. For each cleaned-corpus
@@ -60,10 +70,10 @@ retrieval:
 # personas/<id>/synthetic_queries.json (parallel array, same length
 # and order as cleaned.json). See pipeline.synth_queries.
 synth_queries:
-  batch_size: 20         # comments bundled into one LLM call
-  concurrency: 5         # in-flight requests; lower if you see 429s
+  batch_size: 20 # comments bundled into one LLM call
+  concurrency: 5 # in-flight requests; lower if you see 429s
   max_retries: 5
-  output_language: null  # null = take from persona.language
+  output_language: null # null = take from persona.language
 
 # Style examples (per-response random sampling) -----------------------
 # On each response the engine draws a fresh random subset of cleaned-

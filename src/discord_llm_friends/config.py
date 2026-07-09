@@ -55,6 +55,11 @@ class LLMConfig:
     ])
     temperature: float = 0.6
     max_output_tokens: int = 2000
+    # Per-request HTTP timeout applied to every provider call (generation,
+    # expansion, canonizer, embeddings). Without it an overloaded provider
+    # can hold a connection open for minutes before erroring, and failover
+    # only starts after that wait.
+    request_timeout_seconds: float = 45.0
 
 
 @dataclass(frozen=True)

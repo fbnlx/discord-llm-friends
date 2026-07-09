@@ -37,6 +37,11 @@ llm:
   temperature: 0.9
   max_output_tokens: 2000
 
+  # Per-request HTTP timeout (seconds), all providers + embeddings. Caps how
+  # long an overloaded provider (e.g. a Gemini 503 that takes ~3 minutes to
+  # arrive) can stall a reply before failover moves on to the next provider.
+  request_timeout_seconds: 45
+
 # Embeddings (always OpenAI; project decision) --------------------------
 embedding:
   model: text-embedding-3-large

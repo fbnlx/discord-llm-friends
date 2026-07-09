@@ -21,8 +21,9 @@ Pipeline:
 
 Synthetic personas (persona.canon.enabled) additionally get: canon-fact
 retrieval from the `<id>__canon` collection, the always-injected Timeline
-sheet, and a relaxed improvisation rule (inventions allowed, must stay
-consistent with canon). See canon.py / ADR-0006.
+sheet, a relaxed improvisation rule (inventions allowed, must stay
+consistent with canon), and a per-call rolled Invention mode setting the
+scale of new inventions. See canon.py / ADR-0006.
 
 Env-only knobs (no YAML equivalent):
   PERSONA_DEBUG_PROMPT=1 — print assembled prompts to stderr before the call.
@@ -85,6 +86,44 @@ def _pick_length() -> tuple[str, str]:
     return name, instruction
 
 
+# --- Invention-scale randomization (Synthetic personas only) ----------------
+# A canon-enabled persona may invent new facts (ADR-0006). Left to itself
+# the model collapses onto the safest possible invention every call — a
+# generic, modal future ("normal boring life") — the same collapse family
+# as length and rolled tics. So the SCALE of new inventions is rolled per
+# call from this weighted table and injected as a target. The mode governs
+# ONLY newly invented facts: when the Timeline sheet / established facts /
+# retrieval already answer the question, the injected bullet tells the
+# model to ignore it. Tune by reading INFO logs (invention_mode=) and the
+# canon ledger.
+
+INVENTION_MODES: list[tuple[str, int, str]] = [
+    # (name, weight, instruction-injected-into-prompt)
+    ("mundane",  30, "Everyday scale. New details stay small: routines, "
+                     "chores, minor purchases, small gossip, work minutiae "
+                     "— concrete but ordinary. No twists this reply."),
+    ("notable",  45, "Memorable scale. Make the new detail worth retelling: "
+                     "a named person, a dated event, a real change — a "
+                     "move, a new venture, a breakup, a health scare, an "
+                     "incident, interesting development. Specific, not filler."),
+    ("dramatic", 25, "Bold scale. Assert ONE significant development as "
+                     "hard fact — a birth, a death, a disaster brushing "
+                     "somewhere familiar, a career rupture, a scandal, a "
+                     "windfall, or something great and hopeful — named, dated, one vivid detail. In-genre "
+                     "for this world; consequence, not apocalypse."),
+]
+
+
+def _pick_invention() -> tuple[str, str]:
+    """Roll an invention mode for this response. Returns (name, instruction)."""
+    name, _weight, instruction = random.choices(
+        INVENTION_MODES,
+        weights=[w for _, w, _ in INVENTION_MODES],
+        k=1,
+    )[0]
+    return name, instruction
+
+
 # --- Lazy shared clients (per-process singletons) --------------------------
 
 @lru_cache(maxsize=1)
@@ -94,7 +133,7 @@ def _openai_client() -> OpenAI:
             "OPENAI_API_KEY not set — embeddings require it. "
             "Make sure .env exists and is populated."
         )
-    return OpenAI()
+    return OpenAI(timeout=cfg.CONFIG.llm.request_timeout_seconds)
 
 
 @lru_cache(maxsize=1)
@@ -352,17 +391,40 @@ def _expand_query(question: str, persona: personas_module.Persona) -> list[str]:
 
 # --- Prompt assembly -------------------------------------------------------
 
+def _roll_tics(persona: personas_module.Persona) -> tuple[list[str], int]:
+    """Per-call dice roll over the persona's RolledTics. Returns the
+    directive lines to inject and how many rolled ON. Same reasoning as
+    length modes: a prompt-described frequency ("use X sometimes") collapses
+    into every-reply usage; a mechanical roll holds the target rate."""
+    directives: list[str] = []
+    fired = 0
+    for tic in persona.rolled_tics:
+        if random.random() < tic.p:
+            directives.append(tic.text)
+            fired += 1
+        elif tic.off_text:
+            directives.append(tic.off_text)
+    return directives, fired
+
+
 def _build_system_message(
     persona: personas_module.Persona,
     style_examples: tuple[str, ...],
     length_mode: str,
     length_instruction: str,
+    tic_directives: list[str] | None = None,
+    invention_mode: str | None = None,
+    invention_instruction: str | None = None,
 ) -> str:
     tic_lines = (
         "\n".join(f"- {tic}" for tic in persona.tics)
         if persona.tics
         else "(none specified — infer from examples)"
     )
+    if tic_directives:
+        tic_lines += "\n" + "\n".join(
+            f"- THIS REPLY ONLY: {d}" for d in tic_directives
+        )
     example_lines = "\n".join(f"- {a}" for a in style_examples)
     name = persona.display_name
 
@@ -383,9 +445,12 @@ def _build_system_message(
         f"world {name} lives in. Everything here is canon: {name} lived "
         f"through these events and knows them as fact. NEVER contradict "
         f"this timeline. When asked about events or periods it does not "
-        f"cover, invent details that FIT it (who was in power, what had "
-        f"already happened by then); if you cannot invent something "
-        f"consistent, stay vague rather than contradict.\n"
+        f"cover, invent SPECIFIC details that FIT it (who was in power, "
+        f"what had already happened by then) — filling gaps with concrete, "
+        f"consistent detail is the default. Staying vague is a LAST "
+        f"resort, only for when no consistent detail is possible — never "
+        f"an excuse to dodge a direct question. Contradicting the "
+        f"timeline is never an option.\n"
         f"{persona.timeline}\n"
         f"\n"
         if persona.timeline
@@ -415,6 +480,7 @@ def _build_system_message(
         else ""
     )
 
+    invention_bullet = ""
     if persona.canon.enabled:
         improvise_bullet = (
             f"- IMPROVISE confidently. Extrapolate from {name}'s personality "
@@ -422,10 +488,25 @@ def _build_system_message(
             f"rearrange phrasings from the examples, invent in voice. You "
             f"MAY invent new facts about {name}'s life and world when the "
             f"timeline and established facts don't cover the question — but "
-            f"inventions must be CONSISTENT with them. What you assert "
+            f"inventions must be CONSISTENT with them. Invent SPECIFICS, "
+            f"not generalities: names, years, places, concrete incidents — "
+            f"a generic \"nothing much changed\" is a non-answer, not a "
+            f"safe answer. What you assert "
             f"becomes canon you will be held to later, so commit: give ONE "
             f"concrete answer, not alternatives or hedges.\n"
         )
+        if invention_mode and invention_instruction:
+            invention_bullet = (
+                f"- INVENTION SCALE FOR THIS RESPONSE: {invention_mode} — "
+                f"{invention_instruction} Applies ONLY to NEW facts you "
+                f"invent in this reply: when the timeline, established "
+                f"facts, or retrieved material already answer the question, "
+                f"answer from them and ignore this line — never escalate "
+                f"established facts for effect. Consistency with the "
+                f"timeline and established facts ALWAYS outranks this "
+                f"scale. Override the scale only if the question itself "
+                f"demands a different one.\n"
+            )
     else:
         improvise_bullet = (
             f"- IMPROVISE confidently. Extrapolate from {name}'s personality "
@@ -469,6 +550,7 @@ def _build_system_message(
         f"- STAY ON SUBJECT. Don't pivot to unrelated topics — even within "
         f"a rant, any wandering should stay within the asked subject.\n"
         f"{improvise_bullet}"
+        f"{invention_bullet}"
         f"- DO NOT bring up {name}'s hobbies, games, or specific interests "
         f"unless the user's question already mentions them. The persona "
         f"has many interests; resist the urge to advertise them in every "
@@ -603,7 +685,12 @@ def _call_gemini(system: str, user: str) -> str:
     from google import genai
     from google.genai import types
 
-    client = genai.Client()
+    client = genai.Client(http_options=types.HttpOptions(
+        # google-genai expects milliseconds here. Without a cap, an
+        # overloaded backend can sit on the connection for minutes before
+        # returning its 503 — failover only starts after that wait.
+        timeout=int(cfg.CONFIG.llm.request_timeout_seconds * 1000),
+    ))
     resp = client.models.generate_content(
         model=cfg.CONFIG.llm.models["gemini"],
         contents=user,
@@ -641,7 +728,7 @@ def _call_claude(system: str, user: str) -> str:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
     from anthropic import Anthropic
 
-    client = Anthropic()
+    client = Anthropic(timeout=cfg.CONFIG.llm.request_timeout_seconds)
     resp = client.messages.create(
         model=cfg.CONFIG.llm.models["claude"],
         max_tokens=cfg.CONFIG.llm.max_output_tokens,
@@ -806,15 +893,27 @@ def respond(
                 )
 
     length_mode, length_instruction = _pick_length()
+    tic_directives, tics_fired = _roll_tics(persona)
+    # Keys on canon.enabled (not canon.extraction), matching the
+    # improvise-bullet swap: a persona allowed to invent gets the scale
+    # roll even if post-reply extraction is off.
+    invention_mode, invention_instruction = (
+        _pick_invention() if persona.canon.enabled else (None, None)
+    )
     logger.info(
-        "length_mode=%s persona=%s question=%r style_examples=%d "
-        "stances=%d excerpts=%d canon=%d expanded=%s",
-        length_mode, persona_id, user_question[:80], len(style_examples),
-        len(stances), len(excerpts), len(canon_facts), expanded,
+        "length_mode=%s invention_mode=%s persona=%s question=%r "
+        "style_examples=%d stances=%d excerpts=%d canon=%d expanded=%s "
+        "tic_rolls=%d/%d",
+        length_mode, invention_mode or "-", persona_id, user_question[:80],
+        len(style_examples), len(stances), len(excerpts), len(canon_facts),
+        expanded, tics_fired, len(persona.rolled_tics),
     )
 
     system_msg = _build_system_message(
         persona, style_examples, length_mode, length_instruction,
+        tic_directives=tic_directives,
+        invention_mode=invention_mode,
+        invention_instruction=invention_instruction,
     )
     user_msg = _build_user_message(
         stances=stances,
@@ -833,6 +932,7 @@ def respond(
         return RespondResult(
             text=(
                 f"(PERSONA_DRY_RUN=1 — length_mode={length_mode}; "
+                f"invention_mode={invention_mode or '-'}; "
                 f"LLM call skipped; prompt logged to stderr)"
             ),
             canon_facts=tuple(canon_facts),

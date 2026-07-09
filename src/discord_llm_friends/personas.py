@@ -51,6 +51,21 @@ class PersonaCleanup:
 
 
 @dataclass(frozen=True)
+class RolledTic:
+    """A Tic injected only when a per-call dice roll hits, so a signature
+    quirk appears at a controlled rate instead of in every reply — the same
+    reasoning as the engine's length modes (prompt-described frequency
+    collapses; mechanical rolls hold).
+
+    `text` is injected with probability `p`; otherwise `off_text` (if set)
+    is injected instead — an explicit counter-instruction for quirks the
+    model would over-apply on its own."""
+    p: float
+    text: str
+    off_text: str = ""
+
+
+@dataclass(frozen=True)
 class PersonaCanon:
     """Canon-memory knobs for a Synthetic persona (ADR-0006).
 
@@ -75,6 +90,7 @@ class Persona:
     language: str
     discord: DiscordSpec
     tics: list[str]
+    rolled_tics: list[RolledTic]
     fallback_messages: list[str]
     quota_exhausted_messages: list[str]
     rate_limit_message: str
@@ -186,6 +202,16 @@ def load(persona_id: str, base_dir: Path | None = None) -> Persona:
         timeline_max_chars=int(canon_data.get("timeline_max_chars", 6000)),
     )
 
+    rolled_tics = []
+    for entry in data.get("rolled_tics") or []:
+        tic = RolledTic(
+            p=float(entry.get("p", 0.0)),
+            text=str(entry.get("text", "")).strip(),
+            off_text=str(entry.get("off_text", "")).strip(),
+        )
+        if tic.text and 0.0 < tic.p <= 1.0:
+            rolled_tics.append(tic)
+
     cast_data = data.get("cast") or {}
     cast_personas = {
         str(k): str(v) for k, v in (cast_data.get("personas") or {}).items()
@@ -230,6 +256,7 @@ def load(persona_id: str, base_dir: Path | None = None) -> Persona:
             language=data["language"],
             discord=discord,
             tics=list(data.get("tics") or []),
+            rolled_tics=rolled_tics,
             fallback_messages=list(data.get("fallback_messages") or []),
             quota_exhausted_messages=list(data.get("quota_exhausted_messages") or []),
             rate_limit_message=data.get("rate_limit_message", ""),

@@ -130,6 +130,18 @@ embedding distance (`canon.dedup_max_distance`), and never blocks or fails
 the reply. Quota-exempt — system work, not a user request.
 _Avoid_: learner, memory writer, extractor (alone)
 
+**Invention mode**:
+The per-call rolled scale of what a **Synthetic persona** may newly invent
+in one reply — `mundane` / `notable` / `dramatic`, drawn from a weighted
+engine table (`INVENTION_MODES`), the same mechanism as response-length
+randomization because prompt-described variety collapses onto the safest,
+most generic invention. Shapes ONLY new inventions: when the **Timeline
+sheet**, retrieved **Canon facts**, or corpus already answer the question,
+the mode is inert. Whatever is invented under any mode still becomes
+**Canon** via the **Canonizer** and must fit the **Timeline sheet** —
+consistency outranks the rolled scale.
+_Avoid_: drama mode, creativity dial, invention level
+
 **Consolidation**:
 The offline, maintainer-run pass over a persona's **Canon**: merges
 near-duplicate **Canon facts** (losers marked superseded), proposes
@@ -162,7 +174,12 @@ _Avoid_: trigger, prompt, query (alone)
 **Tic**:
 A short prose description of a characteristic speech pattern of a **Persona**
 (emoticon style, spelling quirks, register). Listed in `persona.yaml` and
-injected into the system prompt alongside the **Voice sample**.
+injected into the system prompt alongside the **Voice sample**. A Tic the
+model would otherwise apply in every reply can be declared as a *rolled*
+Tic (`rolled_tics:` with a probability `p` and an optional counter-
+instruction): the **Runtime** injects it only when a per-call dice roll
+hits — the same mechanism as response-length randomization, because
+prompt-described frequency collapses while mechanical rolls hold.
 _Avoid_: trait, quirk, habit
 
 **Cleanup heuristic**:

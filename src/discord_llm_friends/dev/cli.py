@@ -56,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         stored = canon.canonize_exchange(
             persona, args.question, result.text, result.canon_facts,
+            asker_name=args.asker,
         )
         print(f"[canonize] stored {stored} new fact(s)", file=sys.stderr)
     return 0

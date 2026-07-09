@@ -269,6 +269,8 @@ def _extraction_prompt(
     question: str,
     response: str,
     injected_facts: tuple[str, ...],
+    asker_name: str | None = None,
+    asker_identity: str | None = None,
 ) -> tuple[str, str]:
     name = persona.display_name
     max_new = persona.canon.max_new_facts_per_exchange
@@ -280,7 +282,9 @@ def _extraction_prompt(
         f"A canonical fact is a concrete, reusable assertion that must stay "
         f"STABLE if the same question comes back later: (a) events, dates, "
         f"election results, people, places, technologies, outcomes and "
-        f"biographical changes in {name}'s world or life; (b) standing "
+        f"biographical changes in {name}'s world or life — including what "
+        f"he asserts about OTHER people's lives (the asker's, his "
+        f"friends'); (b) standing "
         f"personal preferences, tastes, habits and self-descriptions {name} "
         f"asserts as durable truths about himself — favourites, loves/hates, "
         f"routines, names he gives to things or people around him. NOT "
@@ -296,8 +300,15 @@ def _extraction_prompt(
         f"\n"
         f"Rules:\n"
         f"- \"fact\": ONE self-contained sentence in {persona.language}, "
-        f"third person, referring to the persona as {name}; write years "
-        f"explicitly. Split independent assertions into separate facts.\n"
+        f"third person, about WHOEVER the reply actually asserts it about "
+        f"— {name} himself, the asker, or another named person in his "
+        f"world. NEVER re-attribute someone else's event to {name}: if the "
+        f"reply says the asker will have surgery, the fact is about the "
+        f"asker, not {name}. Second-person statements (\"you ...\") are "
+        f"about the asker named above the question. Refer to people by the "
+        f"short names the TIMELINE and ESTABLISHED FACTS use for them "
+        f"(reserve \"{name}\" for {name} himself); write years explicitly. "
+        f"Split independent assertions into separate facts.\n"
         f"- \"queries\": 3-5 short {persona.language} questions a user could "
         f"ask that this fact answers, mixed register (neutral and casual), "
         f"INCLUDING one phrasing at a higher abstraction level (e.g. for an "
@@ -320,13 +331,19 @@ def _extraction_prompt(
         "\n".join(f"- {f}" for f in injected_facts) if injected_facts
         else "(none)"
     )
+    asker_line = ""
+    if asker_name:
+        asker_line = (
+            f" (asked by @{asker_name} — {asker_identity})" if asker_identity
+            else f" (asked by @{asker_name})"
+        )
     user = (
         f"TIMELINE (canon):\n{persona.timeline or '(none)'}\n"
         f"\n"
         f"ESTABLISHED FACTS shown to {name} for this reply (canon):\n"
         f"{injected_block}\n"
         f"\n"
-        f"USER QUESTION:\n{question}\n"
+        f"USER QUESTION{asker_line}:\n{question}\n"
         f"\n"
         f"{name.upper()}'S REPLY:\n{response}\n"
         f"\n"
@@ -337,6 +354,7 @@ def _extraction_prompt(
 
 def _parse_extraction(
     persona: personas_module.Persona, raw_text: str, question: str,
+    asker_name: str | None = None,
 ) -> tuple[list[CanonFact], int]:
     """Parse the extractor's JSON into CanonFacts. Returns (facts, invalid
     count). Tolerant where safe (date_scope coerced to 'undated'), strict
@@ -384,7 +402,10 @@ def _parse_extraction(
                 date_scope=date_scope,
                 tags=list(entry.get("tags") or [])[:3],
                 source="emergent",
-                provenance={"question": question[:300]},
+                provenance=(
+                    {"question": question[:300], "asker": asker_name}
+                    if asker_name else {"question": question[:300]}
+                ),
             ))
         except Exception:
             invalid += 1
@@ -396,6 +417,7 @@ def canonize_exchange(
     question: str,
     response: str,
     injected_facts: tuple[str, ...] = (),
+    asker_name: str | None = None,
 ) -> int:
     """Extract and commit new canon facts from one exchange. Returns the
     number of facts stored. Never raises for operational failures — the
@@ -410,7 +432,16 @@ def canonize_exchange(
     # model output, then a per-fact verdict for every candidate.
     debug = engine.DEBUG_PROMPT
 
-    system, user = _extraction_prompt(persona, question, response, injected_facts)
+    # The same cast resolution the responder saw: without it the extractor
+    # cannot attribute second-person answers ("you will ...") to the asker.
+    asker_identity = (
+        engine._cast_identity(persona.cast_users, asker_name)
+        if asker_name else None
+    )
+    system, user = _extraction_prompt(
+        persona, question, response, injected_facts,
+        asker_name=asker_name, asker_identity=asker_identity,
+    )
     if debug:
         bar = "─" * 60
         print(
@@ -432,7 +463,7 @@ def canonize_exchange(
     if debug:
         print(f"[canonizer] raw model output:\n{raw}", file=sys.stderr)
 
-    candidates, invalid = _parse_extraction(persona, raw, question)
+    candidates, invalid = _parse_extraction(persona, raw, question, asker_name)
     if debug:
         print(
             f"[canonizer] parsed {len(candidates)} candidate fact(s), "

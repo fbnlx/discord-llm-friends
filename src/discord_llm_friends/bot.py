@@ -29,6 +29,7 @@ from datetime import date
 import discord
 from discord import app_commands
 
+from discord_llm_friends import canon
 from discord_llm_friends import config as cfg
 from discord_llm_friends import engine
 from discord_llm_friends import personas as personas_module
@@ -131,6 +132,35 @@ def _split_for_discord(text: str, limit: int) -> list[str]:
     return chunks
 
 
+# --- Canonizer background tasks --------------------------------------------
+
+# Fire-and-forget tasks need a strong reference — asyncio keeps only weak
+# ones, so an unreferenced task can be garbage-collected mid-flight.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+async def _canonize_background(
+    persona: Persona,
+    question: str,
+    result: engine.RespondResult,
+    logger: logging.Logger,
+) -> None:
+    """Run the Canonizer for one exchange. The reply has already been sent —
+    failures here are logged and swallowed, never user-visible."""
+    try:
+        stored = await asyncio.to_thread(
+            canon.canonize_exchange,
+            persona,
+            question,
+            result.text,
+            result.canon_facts,
+        )
+        if stored:
+            logger.info("canonizer stored %d new fact(s)", stored)
+    except Exception:
+        logger.exception("canonizer failed — response already sent, skipping")
+
+
 # --- Client builder -------------------------------------------------------
 
 def _fallback_text(persona: Persona) -> str:
@@ -221,13 +251,14 @@ def build_client(persona: Persona) -> discord.Client:
                 user_id, remaining, len(recent_history), question[:200],
             )
 
-            response_text = await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 engine.respond,
                 persona.id,
                 question,
                 recent_history,
                 user_name,
             )
+            response_text = result.text
 
             logger.info(
                 "response user=%s length=%d", user_id, len(response_text),
@@ -262,6 +293,20 @@ def build_client(persona: Persona) -> discord.Client:
 
             for chunk in _split_for_discord(message_body, bot_cfg.max_discord_message_chars):
                 await interaction.followup.send(chunk)
+
+            # Canonizer (Synthetic personas only): extract new canon facts
+            # from what was just said. Spawned only after the reply actually
+            # went out — an unsent reply must not become canon.
+            if (
+                persona.canon.enabled
+                and persona.canon.extraction
+                and not engine.DRY_RUN
+            ):
+                task = asyncio.create_task(_canonize_background(
+                    persona, question, result, logger,
+                ))
+                _BACKGROUND_TASKS.add(task)
+                task.add_done_callback(_BACKGROUND_TASKS.discard)
 
         except Exception:
             logger.exception("command handler failed after defer")

@@ -73,6 +73,80 @@ persona folder and is appended to EVERY system prompt after
 questions. Distinct from `description.md`, which stays hand-written.
 _Avoid_: bio, profile (alone), description
 
+**Synthetic persona**:
+A **Persona** with no real **Corpus** for its own era — its identity is
+manufactured from earlier editions of the same person (**Essence**
+distillation → maturation) plus a **World bible**, and it is allowed to
+invent facts under **Canon** rules. Gated by `canon.enabled` in
+`persona.yaml`; all other personas are unaffected.
+_Avoid_: fictional persona, fake persona, future persona (as a term)
+
+**Essence**:
+The distilled durable identity material of an existing **Persona** —
+traits, values, quirks, core memories, relationship dynamics — extracted
+from its **Stance cards** / **Corpus**. The ONLY source material a
+**Synthetic persona**'s maturation consumes: compression over coverage,
+franchise minutiae collapses into a couple of core memories.
+_Avoid_: summary, digest, profile (alone)
+
+**World bible**:
+The maintainer-reviewed source narrative of a **Synthetic persona**'s
+invented world: a dated timeline in tracks (world / Europe / Hungary /
+personal) plus a glossary of fictional entities — one fact per bullet,
+each with a stable id and pre-authored retrieval queries. Seeds the
+**Canon**; grounds maturation and the **Dossier**.
+_Avoid_: backstory, lore doc, timeline (when meaning this)
+
+**Canon**:
+The growing set of established facts about a **Synthetic persona**'s
+invented world. Seeded from the **World bible**, grown at **Runtime** by
+the **Canonizer**, surfaced as the **Timeline sheet** (every prompt) plus
+retrieved **Canon facts** (per query). First written wins: the **Runtime**
+never rewrites canon — merging and superseding belong to **Consolidation**.
+_Avoid_: lore, memory (alone), knowledge base
+
+**Canon fact**:
+One atomic third-person sentence about the **Synthetic persona**'s world
+or life, carrying 3–7 mixed-register retrieval queries, a date scope, tags,
+and a `seed`/`emergent` source. Ledgered append-only in
+`personas/<id>/canon/facts.jsonl` (the truth) and embedded doc2query-style
+into the `<id>__canon` collection (a rebuildable cache).
+_Avoid_: claim (taken), fact (alone), memory entry
+
+**Timeline sheet**:
+The always-injected dated skeleton of the invented world
+(`personas/<id>/canon/timeline.md`) — the **Canon** analog of the
+**Dossier**. Carries the load-bearing dated facts so cross-fact consistency
+(who was in power when) holds globally, not just when retrieval gets lucky.
+Size-budgeted: the loader warns beyond `canon.timeline_max_chars` but never
+truncates; **Consolidation** trims editorially.
+_Avoid_: chronology, timeline (alone)
+
+**Canonizer**:
+The post-response extraction pass of a **Synthetic persona**: fired-and-
+forgotten after the reply is sent, it turns new world/life assertions in
+the response into **Canon facts**, drops duplicates of existing canon by
+embedding distance (`canon.dedup_max_distance`), and never blocks or fails
+the reply. Quota-exempt — system work, not a user request.
+_Avoid_: learner, memory writer, extractor (alone)
+
+**Consolidation**:
+The offline, maintainer-run pass over a persona's **Canon**: merges
+near-duplicate **Canon facts** (losers marked superseded), proposes
+**Timeline sheet** promotions for facts that proved load-bearing, compacts
+the ledger, rebuilds the collection. The only thing allowed to rewrite
+canon.
+_Avoid_: cleanup (taken), compaction
+
+**Cast**:
+A per-persona map of known identities, declared under `cast:` in
+`persona.yaml`: other bot persona ids → who they are to THIS persona, and
+Discord handles → the real person behind them. Injected as a system-prompt
+block; when the asker's handle matches, the question line is annotated with
+their identity. Handles are matched case-insensitively against the Discord
+display name — add multiple keys if display name and username differ.
+_Avoid_: contacts, user map, aliases
+
 **Synthetic query**:
 A one-line LLM-generated string that hypothesizes what user question,
 topic, or trigger would plausibly prompt a given **Corpus** entry as a
@@ -130,3 +204,15 @@ _Avoid_: server, app
   comments) as two separately-framed prompt sections; the **Dossier**
   rides in the system prompt on every call.
 - Each **Persona** maps to exactly one Discord slash command at **Runtime**.
+- A **Synthetic persona**'s artifacts are manufactured, not extracted:
+  **Essence** (distilled from earlier editions of the same person) +
+  **World bible** + real-life anchor facts → matured **Stance cards**,
+  **Dossier**, and **Voice pool**; the **World bible** seeds its **Canon**.
+- At **Runtime**, a **Synthetic persona** additionally retrieves up to
+  `canon.max_facts` **Canon facts** from its own `<id>__canon` collection
+  (own distance floor; injected before the stance section), carries the
+  **Timeline sheet** in every system prompt, and — after each reply is
+  sent — may have the **Canonizer** append new **Canon facts**. This is
+  the one sanctioned exception to the Pipeline/Runtime split (ADR-0006).
+- A **Persona** may declare a **Cast**; the **Runtime** injects it so the
+  persona recognizes the other personas and known humans it talks to.

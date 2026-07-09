@@ -23,6 +23,7 @@ doesn't try to start a bot for it.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,6 +51,24 @@ class PersonaCleanup:
 
 
 @dataclass(frozen=True)
+class PersonaCanon:
+    """Canon-memory knobs for a Synthetic persona (ADR-0006).
+
+    Disabled by default. Enabling turns on canon retrieval (the
+    `<id>__canon` collection), the always-injected Timeline sheet, and the
+    post-response Canonizer. Distances are L2 in the shared embedding
+    space, same scale as CONFIG.retrieval floors.
+    """
+    enabled: bool = False
+    extraction: bool = True
+    max_facts: int = 3
+    max_distance: float = 0.80
+    dedup_max_distance: float = 0.35
+    max_new_facts_per_exchange: int = 3
+    timeline_max_chars: int = 6000
+
+
+@dataclass(frozen=True)
 class Persona:
     id: str
     display_name: str
@@ -67,6 +86,22 @@ class Persona:
     """Full prose content of dossier.md ("" if absent) — generated identity
     profile appended to the system prompt after the description."""
 
+    timeline: str
+    """Timeline sheet (canon/timeline.md, "" if absent) — always-injected
+    dated skeleton of a Synthetic persona's invented world; the canon
+    analog of the dossier."""
+
+    canon: PersonaCanon
+    """Canon-memory configuration (`canon:` in persona.yaml)."""
+
+    cast_personas: dict[str, str]
+    """Cast: other bot persona ids → who they are to THIS persona (e.g.
+    a future edition knowing `peter` is his own younger self)."""
+
+    cast_users: dict[str, str]
+    """Cast: Discord handles → the real identity behind them, so the
+    persona knows who is prompting."""
+
     folder: Path
     """Where this persona lives on disk. Useful for derived paths."""
 
@@ -83,6 +118,22 @@ class Persona:
     @property
     def voice_pool_path(self) -> Path:
         return self.folder / "voice_pool.json"
+
+    @property
+    def canon_dir(self) -> Path:
+        return self.folder / "canon"
+
+    @property
+    def canon_ledger_path(self) -> Path:
+        return self.canon_dir / "facts.jsonl"
+
+    @property
+    def timeline_path(self) -> Path:
+        return self.canon_dir / "timeline.md"
+
+    @property
+    def world_bible_path(self) -> Path:
+        return self.canon_dir / "world_bible.json"
 
 
 # --- Loader -----------------------------------------------------------------
@@ -122,6 +173,27 @@ def load(persona_id: str, base_dir: Path | None = None) -> Persona:
         drop_system_messages=list(cleanup_data.get("drop_system_messages") or []),
     )
 
+    canon_data = data.get("canon") or {}
+    canon = PersonaCanon(
+        enabled=bool(canon_data.get("enabled", False)),
+        extraction=bool(canon_data.get("extraction", True)),
+        max_facts=int(canon_data.get("max_facts", 3)),
+        max_distance=float(canon_data.get("max_distance", 0.80)),
+        dedup_max_distance=float(canon_data.get("dedup_max_distance", 0.35)),
+        max_new_facts_per_exchange=int(
+            canon_data.get("max_new_facts_per_exchange", 3)
+        ),
+        timeline_max_chars=int(canon_data.get("timeline_max_chars", 6000)),
+    )
+
+    cast_data = data.get("cast") or {}
+    cast_personas = {
+        str(k): str(v) for k, v in (cast_data.get("personas") or {}).items()
+    }
+    cast_users = {
+        str(k): str(v) for k, v in (cast_data.get("users") or {}).items()
+    }
+
     description_path = folder / "description.md"
     description = (
         description_path.read_text(encoding="utf-8").strip()
@@ -136,6 +208,21 @@ def load(persona_id: str, base_dir: Path | None = None) -> Persona:
         else ""
     )
 
+    timeline_file = folder / "canon" / "timeline.md"
+    timeline = (
+        timeline_file.read_text(encoding="utf-8").strip()
+        if timeline_file.exists()
+        else ""
+    )
+    if timeline and len(timeline) > canon.timeline_max_chars:
+        # Never truncate — a reviewed load-bearing dated fact silently
+        # dropped is worse than a fat prompt. Consolidation trims editorially.
+        logging.getLogger(__name__).warning(
+            "%s: canon/timeline.md is %d chars (budget %d) — injected whole; "
+            "trim it via canon consolidation",
+            persona_id, len(timeline), canon.timeline_max_chars,
+        )
+
     try:
         return Persona(
             id=data["id"],
@@ -149,6 +236,10 @@ def load(persona_id: str, base_dir: Path | None = None) -> Persona:
             cleanup=cleanup,
             description=description,
             dossier=dossier,
+            timeline=timeline,
+            canon=canon,
+            cast_personas=cast_personas,
+            cast_users=cast_users,
             folder=folder,
         )
     except KeyError as e:

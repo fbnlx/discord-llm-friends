@@ -16,7 +16,13 @@ Pipeline:
      question).
   5. Dispatch to the LLM provider selected by CONFIG.llm.provider,
      failing over to the next provider in CONFIG.llm.fallback_order on error.
-  6. Return the generated response string.
+  6. Return a RespondResult (reply text + the canon facts injected, so the
+     Canonizer can see exactly what the model saw).
+
+Synthetic personas (persona.canon.enabled) additionally get: canon-fact
+retrieval from the `<id>__canon` collection, the always-injected Timeline
+sheet, and a relaxed improvisation rule (inventions allowed, must stay
+consistent with canon). See canon.py / ADR-0006.
 
 Env-only knobs (no YAML equivalent):
   PERSONA_DEBUG_PROMPT=1 — print assembled prompts to stderr before the call.
@@ -29,12 +35,14 @@ import logging
 import os
 import random
 import sys
+from dataclasses import dataclass
 from functools import lru_cache
 
 import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
 
+from discord_llm_friends import canon
 from discord_llm_friends import config as cfg
 from discord_llm_friends import personas as personas_module
 from discord_llm_friends.history import Exchange
@@ -123,8 +131,20 @@ def _voice_pool(persona_id: str) -> tuple[str, ...]:
 STANCE_SLOTS = 2
 
 
+def _embed_queries(queries: list[str]) -> list[list[float]]:
+    """One embeddings API call for all phrasings — shared by corpus and
+    canon retrieval, so a canon-enabled persona pays no extra embedding."""
+    return [
+        d.embedding
+        for d in _openai_client().embeddings.create(
+            model=cfg.CONFIG.embedding.model, input=queries,
+        ).data
+    ]
+
+
 def _retrieve(
     persona_id: str, queries: list[str], n: int, floor_bonus: float = 0.0,
+    query_vecs: list[list[float]] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Embed the query phrasing(s) and pull the nearest stored units.
 
@@ -144,13 +164,12 @@ def _retrieve(
     The collection holds several rows per unit (one per synthetic query
     pointing at it), so hits are deduped by unit id — card_id / window_id
     metadata when present, the document text itself for legacy comment rows.
+
+    `query_vecs`, when given, must align with `queries` (caller already
+    embedded them); when None they are embedded here.
     """
-    query_vecs = [
-        d.embedding
-        for d in _openai_client().embeddings.create(
-            model=cfg.CONFIG.embedding.model, input=queries,
-        ).data
-    ]
+    if query_vecs is None:
+        query_vecs = _embed_queries(queries)
 
     rc = cfg.CONFIG.retrieval
     collection = _chroma_client().get_collection(name=persona_id)
@@ -222,6 +241,77 @@ def _retrieve(
     return stances, excerpts
 
 
+# Warn once per persona when canon is enabled but the collection is absent
+# (enabled-but-not-yet-seeded is a legitimate transient state, not an error).
+_CANON_MISSING_WARNED: set[str] = set()
+
+
+def _retrieve_canon(
+    persona: personas_module.Persona,
+    queries: list[str],
+    query_vecs: list[list[float]],
+    floor_bonus: float = 0.0,
+) -> list[str]:
+    """Nearest active Canon facts for this question, deduped by fact_id.
+
+    Returns up to persona.canon.max_facts fact documents within
+    persona.canon.max_distance (+ floor_bonus), nearest first. The floor is
+    deliberately permissive: a marginally related fact CONSTRAINS invention
+    (the prompt says "never contradict", not "must use"), so recall beats
+    precision here.
+    """
+    name = canon.collection_name(persona.id)
+    try:
+        collection = _chroma_client().get_collection(name=name)
+    except Exception:
+        if persona.id not in _CANON_MISSING_WARNED:
+            _CANON_MISSING_WARNED.add(persona.id)
+            logger.warning(
+                "canon enabled for %s but collection %r is missing — run "
+                "pipeline.canon_seed or pipeline.canon_rebuild",
+                persona.id, name,
+            )
+        return []
+
+    count = collection.count()
+    if count == 0:
+        return []
+    cc = persona.canon
+    result = collection.query(
+        query_embeddings=query_vecs,
+        n_results=min(cc.max_facts * 4, count),
+        include=["documents", "metadatas", "distances"],
+    )
+    best: dict[str, tuple[float, str]] = {}
+    for qi in range(len(query_vecs)):
+        for doc, meta, dist in zip(
+            result["documents"][qi], result["metadatas"][qi], result["distances"][qi]
+        ):
+            fact_id = (meta or {}).get("fact_id") or doc
+            if fact_id not in best or dist < best[fact_id][0]:
+                best[fact_id] = (dist, doc)
+
+    floor = cc.max_distance + floor_bonus
+    ranked = sorted(best.values(), key=lambda x: x[0])
+    facts = [doc for dist, doc in ranked if dist <= floor][: cc.max_facts]
+    nearest = ranked[0][0] if ranked else None
+    dropped = len(ranked) - len(facts)
+
+    logger.info(
+        "canon persona=%s phrasings=%d kept=%d nearest=%s dropped=%d",
+        persona.id, len(queries), len(facts),
+        f"{nearest:.3f}" if nearest is not None else "na", dropped,
+    )
+    if DEBUG_PROMPT or DRY_RUN:
+        nf = f"{nearest:.3f}" if nearest is not None else "—"
+        print(
+            f"[canon] {len(queries)} phrasing(s); nearest fact={nf} "
+            f"(floor {floor:.2f}) → kept {len(facts)} / dropped {dropped}",
+            file=sys.stderr,
+        )
+    return facts
+
+
 # Runtime query expansion (conditional). Only fires when the first retrieval
 # pass found nothing within the distance floor — typically a slangy/vulgar
 # phrasing that embeds far from the (cleaner) stored card/window queries. A
@@ -288,6 +378,63 @@ def _build_system_message(
         else ""
     )
 
+    timeline_block = (
+        f"{name.upper()}'S WORLD TIMELINE — the established history of the "
+        f"world {name} lives in. Everything here is canon: {name} lived "
+        f"through these events and knows them as fact. NEVER contradict "
+        f"this timeline. When asked about events or periods it does not "
+        f"cover, invent details that FIT it (who was in power, what had "
+        f"already happened by then); if you cannot invent something "
+        f"consistent, stay vague rather than contradict.\n"
+        f"{persona.timeline}\n"
+        f"\n"
+        if persona.timeline
+        else ""
+    )
+
+    cast_lines: list[str] = []
+    if persona.cast_personas:
+        cast_lines.append(
+            "Bot personas that may appear in the conversation — treat "
+            "their words accordingly:"
+        )
+        cast_lines += [
+            f"- {pid}: {who}" for pid, who in persona.cast_personas.items()
+        ]
+    if persona.cast_users:
+        cast_lines.append(
+            f"Known humans by Discord handle — when one of these asks, "
+            f"{name} knows exactly who is talking:"
+        )
+        cast_lines += [
+            f"- {handle}: {who}" for handle, who in persona.cast_users.items()
+        ]
+    cast_block = (
+        f"WHO {name.upper()} MAY BE TALKING TO:\n" + "\n".join(cast_lines) + "\n\n"
+        if cast_lines
+        else ""
+    )
+
+    if persona.canon.enabled:
+        improvise_bullet = (
+            f"- IMPROVISE confidently. Extrapolate from {name}'s personality "
+            f"to say new things this person could plausibly say — don't just "
+            f"rearrange phrasings from the examples, invent in voice. You "
+            f"MAY invent new facts about {name}'s life and world when the "
+            f"timeline and established facts don't cover the question — but "
+            f"inventions must be CONSISTENT with them. What you assert "
+            f"becomes canon you will be held to later, so commit: give ONE "
+            f"concrete answer, not alternatives or hedges.\n"
+        )
+    else:
+        improvise_bullet = (
+            f"- IMPROVISE confidently. Extrapolate from {name}'s personality "
+            f"to say new things this person could plausibly say — don't just "
+            f"rearrange phrasings from the examples, invent in voice. Just "
+            f"don't invent biographical facts (no new family members, schools, "
+            f"jobs, etc.).\n"
+        )
+
     return (
         f"You are responding AS {name}. Stay completely in character. Respond "
         f"ONLY in {persona.language}, in {name}'s voice. Do not announce "
@@ -298,6 +445,8 @@ def _build_system_message(
         f"{persona.description}\n"
         f"\n"
         f"{dossier_block}"
+        f"{timeline_block}"
+        f"{cast_block}"
         f"CHARACTERISTIC SPEECH TICS TO PRESERVE:\n"
         f"{tic_lines}\n"
         f"\n"
@@ -319,11 +468,7 @@ def _build_system_message(
         f"picked).\n"
         f"- STAY ON SUBJECT. Don't pivot to unrelated topics — even within "
         f"a rant, any wandering should stay within the asked subject.\n"
-        f"- IMPROVISE confidently. Extrapolate from {name}'s personality "
-        f"to say new things this person could plausibly say — don't just "
-        f"rearrange phrasings from the examples, invent in voice. Just "
-        f"don't invent biographical facts (no new family members, schools, "
-        f"jobs, etc.).\n"
+        f"{improvise_bullet}"
         f"- DO NOT bring up {name}'s hobbies, games, or specific interests "
         f"unless the user's question already mentions them. The persona "
         f"has many interests; resist the urge to advertise them in every "
@@ -356,6 +501,19 @@ def _format_history(history: list[Exchange]) -> str:
     return "\n".join(lines)
 
 
+def _cast_identity(
+    cast_users: dict[str, str] | None, asker_name: str,
+) -> str | None:
+    """Case-insensitive lookup of a Discord handle in the persona's cast."""
+    if not cast_users:
+        return None
+    needle = asker_name.strip().casefold()
+    for handle, identity in cast_users.items():
+        if handle.strip().casefold() == needle:
+            return identity
+    return None
+
+
 def _build_user_message(
     stances: list[str],
     excerpts: list[str],
@@ -363,6 +521,8 @@ def _build_user_message(
     name: str,
     history: list[Exchange] | None,
     asker_name: str | None,
+    canon_facts: list[str] | None = None,
+    cast_users: dict[str, str] | None = None,
 ) -> str:
     sections: list[str] = []
 
@@ -370,6 +530,20 @@ def _build_user_message(
         sections.append(
             "RECENT CONVERSATION IN THIS CHANNEL (oldest first):\n"
             + _format_history(history)
+        )
+
+    # Canon precedes stances: world facts constrain the answer before
+    # opinions color it.
+    if canon_facts:
+        fact_block = "\n".join(f"- {f}" for f in canon_facts)
+        sections.append(
+            f"ESTABLISHED FACTS OF {name.upper()}'S WORLD — canon facts "
+            f"retrieved as relevant to this question. These are TRUE in "
+            f"{name}'s world and non-negotiable: never contradict them, and "
+            f"build on the ones that apply. If the question goes beyond "
+            f"them, invent an answer CONSISTENT with them and with the "
+            f"world timeline:\n"
+            f"{fact_block}"
         )
 
     if stances:
@@ -400,7 +574,13 @@ def _build_user_message(
             f"{excerpt_block}"
         )
 
-    asker_prefix = f" (from @{asker_name})" if asker_name else ""
+    asker_prefix = ""
+    if asker_name:
+        identity = _cast_identity(cast_users, asker_name)
+        asker_prefix = (
+            f" (from @{asker_name} — {identity})" if identity
+            else f" (from @{asker_name})"
+        )
     sections.append(f"User's new question{asker_prefix}: {question}")
     sections.append(f"Respond as {name}:")
 
@@ -560,12 +740,22 @@ def call_llm(system: str, user: str) -> str:
 
 # --- Public entry point ----------------------------------------------------
 
+@dataclass(frozen=True)
+class RespondResult:
+    """respond()'s full result: the reply text plus the canon facts that
+    were actually injected into the prompt. The Canonizer needs exactly
+    what the model saw — re-retrieval could not reproduce it."""
+
+    text: str
+    canon_facts: tuple[str, ...] = ()
+
+
 def respond(
     persona_id: str,
     user_question: str,
     history: list[Exchange] | None = None,
     asker_name: str | None = None,
-) -> str:
+) -> RespondResult:
     """Produce a single in-character response in the persona's voice.
 
     `history` is a list of recent Exchange objects (oldest first) to surface
@@ -579,8 +769,14 @@ def respond(
     style_examples = tuple(
         random.sample(corpus, min(sample_size, len(corpus)))
     )
+    query_vecs = _embed_queries([user_question])
     stances, excerpts = _retrieve(
         persona_id, [user_question], cfg.CONFIG.retrieval.top_k,
+        query_vecs=query_vecs,
+    )
+    canon_facts: list[str] = (
+        _retrieve_canon(persona, [user_question], query_vecs)
+        if persona.canon.enabled else []
     )
     # Conditional query expansion: only when the first pass found nothing
     # within the distance floor (e.g. a slangy phrasing that embeds far from
@@ -595,18 +791,26 @@ def respond(
             if DEBUG_PROMPT:
                 print(f"[expansion] first pass empty — retrying with {variants}",
                       file=sys.stderr)
+            all_queries = [user_question, *variants]
+            expanded_vecs = _embed_queries(all_queries)
             stances, excerpts = _retrieve(
-                persona_id, [user_question, *variants],
+                persona_id, all_queries,
                 cfg.CONFIG.retrieval.top_k,
                 floor_bonus=cfg.CONFIG.retrieval.expanded_floor_bonus,
+                query_vecs=expanded_vecs,
             )
+            if persona.canon.enabled:
+                canon_facts = _retrieve_canon(
+                    persona, all_queries, expanded_vecs,
+                    floor_bonus=cfg.CONFIG.retrieval.expanded_floor_bonus,
+                )
 
     length_mode, length_instruction = _pick_length()
     logger.info(
         "length_mode=%s persona=%s question=%r style_examples=%d "
-        "stances=%d excerpts=%d expanded=%s",
+        "stances=%d excerpts=%d canon=%d expanded=%s",
         length_mode, persona_id, user_question[:80], len(style_examples),
-        len(stances), len(excerpts), expanded,
+        len(stances), len(excerpts), len(canon_facts), expanded,
     )
 
     system_msg = _build_system_message(
@@ -619,14 +823,22 @@ def respond(
         name=persona.display_name,
         history=history,
         asker_name=asker_name,
+        canon_facts=canon_facts,
+        cast_users=persona.cast_users,
     )
 
     _maybe_log_prompt(system_msg, user_msg)
 
     if DRY_RUN:
-        return (
-            f"(PERSONA_DRY_RUN=1 — length_mode={length_mode}; "
-            f"LLM call skipped; prompt logged to stderr)"
+        return RespondResult(
+            text=(
+                f"(PERSONA_DRY_RUN=1 — length_mode={length_mode}; "
+                f"LLM call skipped; prompt logged to stderr)"
+            ),
+            canon_facts=tuple(canon_facts),
         )
 
-    return call_llm(system_msg, user_msg)
+    return RespondResult(
+        text=call_llm(system_msg, user_msg),
+        canon_facts=tuple(canon_facts),
+    )

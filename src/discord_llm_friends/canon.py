@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 
 from discord_llm_friends import config as cfg
 from discord_llm_friends import personas as personas_module
+from discord_llm_friends.history import Exchange, format_history
 
 
 logger = logging.getLogger(__name__)
@@ -271,9 +272,26 @@ def _extraction_prompt(
     injected_facts: tuple[str, ...],
     asker_name: str | None = None,
     asker_identity: str | None = None,
+    history: list[Exchange] | None = None,
 ) -> tuple[str, str]:
     name = persona.display_name
     max_new = persona.canon.max_new_facts_per_exchange
+    # Follow-up questions/replies are often elliptical ("hány szobás a
+    # ház?") — the subject lives in the conversation, which the responder
+    # saw. Without it the extractor guesses from the TIMELINE.
+    history_rules = (
+        (
+            f"- The question and reply may be elliptical FOLLOW-UPS to the "
+            f"RECENT CONVERSATION — resolve who and what they refer to from "
+            f"it (e.g. \"the house\" means the house discussed there, owned "
+            f"by whoever owns it there).\n"
+            f"- Extract facts ONLY from {name}'s reply below. The RECENT "
+            f"CONVERSATION is context for resolving references, never a "
+            f"source of new facts — earlier replies were already "
+            f"processed.\n"
+        )
+        if history else ""
+    )
     system = (
         f"You maintain the canon fact database for {name}, a fictional "
         f"persona who is allowed to invent facts about their world. You "
@@ -309,6 +327,12 @@ def _extraction_prompt(
         f"short names the TIMELINE and ESTABLISHED FACTS use for them "
         f"(reserve \"{name}\" for {name} himself); write years explicitly. "
         f"Split independent assertions into separate facts.\n"
+        f"{history_rules}"
+        f"- Ground every fact in what the reply actually asserts. NEVER "
+        f"import names, places or details from the TIMELINE that the reply "
+        f"did not state. If you cannot determine WHO a fact is about from "
+        f"the conversation, question and reply, DROP that fact — never "
+        f"guess a subject from the TIMELINE.\n"
         f"- \"queries\": 3-5 short {persona.language} questions a user could "
         f"ask that this fact answers, mixed register (neutral and casual), "
         f"INCLUDING one phrasing at a higher abstraction level (e.g. for an "
@@ -337,12 +361,19 @@ def _extraction_prompt(
             f" (asked by @{asker_name} — {asker_identity})" if asker_identity
             else f" (asked by @{asker_name})"
         )
+    history_block = (
+        f"RECENT CONVERSATION (context — the question and reply below "
+        f"continue it):\n{format_history(history)}\n"
+        f"\n"
+        if history else ""
+    )
     user = (
         f"TIMELINE (canon):\n{persona.timeline or '(none)'}\n"
         f"\n"
         f"ESTABLISHED FACTS shown to {name} for this reply (canon):\n"
         f"{injected_block}\n"
         f"\n"
+        f"{history_block}"
         f"USER QUESTION{asker_line}:\n{question}\n"
         f"\n"
         f"{name.upper()}'S REPLY:\n{response}\n"
@@ -418,6 +449,7 @@ def canonize_exchange(
     response: str,
     injected_facts: tuple[str, ...] = (),
     asker_name: str | None = None,
+    history: list[Exchange] | None = None,
 ) -> int:
     """Extract and commit new canon facts from one exchange. Returns the
     number of facts stored. Never raises for operational failures — the
@@ -441,6 +473,7 @@ def canonize_exchange(
     system, user = _extraction_prompt(
         persona, question, response, injected_facts,
         asker_name=asker_name, asker_identity=asker_identity,
+        history=history,
     )
     if debug:
         bar = "─" * 60

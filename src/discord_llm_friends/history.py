@@ -60,6 +60,17 @@ class Exchange:
         )
 
 
+def format_history(history: list[Exchange]) -> str:
+    """Render exchanges the way prompts show them — one line per turn,
+    speaker-labeled. Shared by the responder prompt and the Canonizer's
+    extraction prompt, so both see the identical conversation context."""
+    lines = []
+    for ex in history:
+        lines.append(f"[{ex.user_name} → {ex.persona}]: {ex.question}")
+        lines.append(f"[{ex.persona}]: {ex.response}")
+    return "\n".join(lines)
+
+
 class ChannelHistory:
     """JSON-backed conversation history for a single Discord channel."""
 

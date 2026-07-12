@@ -144,6 +144,7 @@ async def _canonize_background(
     question: str,
     result: engine.RespondResult,
     asker_name: str | None,
+    history: list[Exchange],
     logger: logging.Logger,
 ) -> None:
     """Run the Canonizer for one exchange. The reply has already been sent —
@@ -156,6 +157,7 @@ async def _canonize_background(
             result.text,
             result.canon_facts,
             asker_name,
+            history,
         )
         if stored:
             logger.info("canonizer stored %d new fact(s)", stored)
@@ -305,7 +307,8 @@ def build_client(persona: Persona) -> discord.Client:
                 and not engine.DRY_RUN
             ):
                 task = asyncio.create_task(_canonize_background(
-                    persona, question, result, user_name, logger,
+                    persona, question, result, user_name, recent_history,
+                    logger,
                 ))
                 _BACKGROUND_TASKS.add(task)
                 task.add_done_callback(_BACKGROUND_TASKS.discard)

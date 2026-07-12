@@ -46,7 +46,7 @@ from openai import OpenAI
 from discord_llm_friends import canon
 from discord_llm_friends import config as cfg
 from discord_llm_friends import personas as personas_module
-from discord_llm_friends.history import Exchange
+from discord_llm_friends.history import Exchange, format_history
 
 
 logger = logging.getLogger(__name__)
@@ -575,14 +575,6 @@ def _build_system_message(
     )
 
 
-def _format_history(history: list[Exchange]) -> str:
-    lines = []
-    for ex in history:
-        lines.append(f"[{ex.user_name} → {ex.persona}]: {ex.question}")
-        lines.append(f"[{ex.persona}]: {ex.response}")
-    return "\n".join(lines)
-
-
 def _cast_identity(
     cast_users: dict[str, str] | None, asker_name: str,
 ) -> str | None:
@@ -611,7 +603,7 @@ def _build_user_message(
     if history:
         sections.append(
             "RECENT CONVERSATION IN THIS CHANNEL (oldest first):\n"
-            + _format_history(history)
+            + format_history(history)
         )
 
     # Canon precedes stances: world facts constrain the answer before

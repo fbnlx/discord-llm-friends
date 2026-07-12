@@ -22,7 +22,7 @@ llm:
   models:
     gemini: gemini-3.5-flash
     claude: claude-haiku-4-5
-    openai: gpt-5.4
+    openai: gpt-5.6-terra
 
   # Failover chain. If the selected provider errors (e.g. a 503 "model is
   # overloaded", a rate limit, or a blocked/empty response), the engine
@@ -34,7 +34,7 @@ llm:
   fallback_order: [gemini, openai, claude]
 
   # Generation knobs applied uniformly across providers.
-  temperature: 0.9
+  temperature: 1
   max_output_tokens: 2000
 
   # Per-request HTTP timeout (seconds), all providers + embeddings. Caps how

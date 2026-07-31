@@ -20,7 +20,7 @@ llm:
   # Model identifier for each provider. Whichever provider is selected,
   # the corresponding identifier is used.
   models:
-    gemini: gemini-3.5-flash
+    gemini: gemini-flash-latest
     claude: claude-haiku-4-5
     openai: gpt-5.6-terra
 

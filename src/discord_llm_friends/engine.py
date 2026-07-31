@@ -690,9 +690,11 @@ def _call_gemini(system: str, user: str) -> str:
             system_instruction=system,
             temperature=cfg.CONFIG.llm.temperature,
             max_output_tokens=cfg.CONFIG.llm.max_output_tokens,
-            # Disable Gemini 2.5+ thinking mode — otherwise reasoning tokens
-            # can leak into the visible response as English meta-commentary.
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            # Hold thinking to the floor — otherwise reasoning tokens can
+            # leak into the visible response as English meta-commentary.
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL,
+            ),
         ),
     )
 

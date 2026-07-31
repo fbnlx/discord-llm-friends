@@ -46,9 +46,9 @@ CONFIG_PATH = ROOT / "config.yaml"
 class LLMConfig:
     provider: str = "gemini"
     models: dict[str, str] = field(default_factory=lambda: {
-        "gemini": "gemini-3.5-flash",
+        "gemini": "gemini-flash-latest",
         "claude": "claude-haiku-4-5",
-        "openai": "gpt-5.4",
+        "openai": "gpt-5.6-terra",
     })
     fallback_order: list[str] = field(default_factory=lambda: [
         "gemini", "openai", "claude",
